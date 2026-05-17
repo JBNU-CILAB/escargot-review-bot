@@ -2,14 +2,16 @@ import json
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import ollama
+from langchain_core.language_models import BaseChatModel
 from langchain_ollama import ChatOllama
 from langchain_core.runnables import RunnableSerializable
 
 from escargot_review_bot.config.config import (
     MODEL_NAME,
+    OLLAMA_BASE_URL,
     OLLAMA_KEEP_ALIVE,
     OLLAMA_MAX_RETRIES,
     OLLAMA_NUM_BATCH,
@@ -17,7 +19,11 @@ from escargot_review_bot.config.config import (
     OLLAMA_REPEAT_PENALTY,
     OLLAMA_TEMPERATURE,
     OLLAMA_TIMEOUT_SECONDS,
+    OPENAI_API_KEY,
+    OPENAI_MAX_TOKENS,
     INTER_REQUEST_DELAY_SECONDS,
+    resolve_pass_model,
+    resolve_pass_provider,
 )
 from escargot_review_bot.config.logging import get_logger
 
@@ -25,55 +31,62 @@ from escargot_review_bot.config.logging import get_logger
 logger = get_logger("review-bot.llm")
 
 
-def get_chat_ollama(
-    model: Optional[str] = None,
-    temperature: Optional[float] = None,
-    num_ctx: Optional[int] = None,
-    num_batch: Optional[int] = None,
-    repeat_penalty: Optional[float] = None,
-    keep_alive: Optional[str] = None,
-) -> ChatOllama:
-    """Create a ChatOllama instance with project defaults.
-    
-    Args:
-        model: Ollama model name. Defaults to MODEL_NAME from config.
-        temperature: Sampling temperature. Defaults to OLLAMA_TEMPERATURE.
-        num_ctx: Context window size. Defaults to OLLAMA_NUM_CTX.
-        num_batch: Batch size. Defaults to OLLAMA_NUM_BATCH.
-        repeat_penalty: Repeat penalty. Defaults to OLLAMA_REPEAT_PENALTY.
-        keep_alive: Keep alive duration. Defaults to OLLAMA_KEEP_ALIVE.
-        
-    Returns:
-        Configured ChatOllama instance.
+_llm_cache: Dict[Tuple[str, str], BaseChatModel] = {}
+
+
+def _build_chat_model(provider: str, model: str) -> BaseChatModel:
+    """Construct a LangChain chat model for the given provider/model.
+
+    Ollama gets its full project parameter set (num_ctx, repeat_penalty, keep_alive);
+    OpenAI gets only the cross-provider params (temperature, max_tokens). Other
+    Ollama-only knobs are intentionally not mapped to OpenAI to keep the comparison
+    honest — see CLAUDE.md §Parameter mapping.
     """
-    return ChatOllama(
-        model=model or MODEL_NAME,
-        temperature=temperature if temperature is not None else OLLAMA_TEMPERATURE,
-        num_ctx=num_ctx if num_ctx is not None else OLLAMA_NUM_CTX,
-        num_predict=-1,
-        repeat_penalty=repeat_penalty if repeat_penalty is not None else OLLAMA_REPEAT_PENALTY,
-        keep_alive=keep_alive if keep_alive is not None else OLLAMA_KEEP_ALIVE,
-    )
+    if provider == "ollama":
+        kwargs = dict(
+            model=model,
+            temperature=OLLAMA_TEMPERATURE,
+            num_ctx=OLLAMA_NUM_CTX,
+            num_predict=-1,
+            repeat_penalty=OLLAMA_REPEAT_PENALTY,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        if OLLAMA_BASE_URL:
+            kwargs["base_url"] = OLLAMA_BASE_URL
+        return ChatOllama(**kwargs)
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI
+        if not OPENAI_API_KEY:
+            raise RuntimeError(
+                "OPENAI_API_KEY is empty but provider=openai was requested."
+            )
+        return ChatOpenAI(
+            model=model,
+            temperature=OLLAMA_TEMPERATURE,
+            max_tokens=OPENAI_MAX_TOKENS,
+            api_key=OPENAI_API_KEY,
+        )
+    raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
-_llm_cache: Dict[str, ChatOllama] = {}
+def get_chat_model(pass_type: str) -> BaseChatModel:
+    """Return a cached chat model for the given review pass.
 
-
-def get_cached_llm(model: str) -> ChatOllama:
-    """Get or create a cached ChatOllama instance for the given model.
-    
-    Caches instances to avoid repeated initialization overhead.
-    
-    Args:
-        model: Ollama model name.
-        
-    Returns:
-        Cached or newly created ChatOllama instance.
+    Provider resolution: `PROVIDER_{PASS}` env > `LLM_PROVIDER` env > "ollama".
+    Model resolution:    `MODEL_{PASS}` env > legacy `OLLAMA_MODEL_{PASS}` env.
     """
-    if model not in _llm_cache:
-        logger.debug(f"Creating new ChatOllama instance for model={model}")
-        _llm_cache[model] = get_chat_ollama(model=model)
-    return _llm_cache[model]
+    provider = resolve_pass_provider(pass_type)
+    model = resolve_pass_model(pass_type)
+    if not model:
+        raise RuntimeError(
+            f"No model configured for pass_type={pass_type}. "
+            f"Set MODEL_{pass_type.upper()} (or legacy OLLAMA_MODEL_{pass_type.upper()})."
+        )
+    key = (provider, model)
+    if key not in _llm_cache:
+        logger.debug(f"Creating chat model provider={provider} model={model}")
+        _llm_cache[key] = _build_chat_model(provider, model)
+    return _llm_cache[key]
 
 
 def clear_llm_cache() -> None:
@@ -322,53 +335,6 @@ def chat_and_parse(
     return []
 
 
-def build_review_chain(
-    pass_type: str,
-    model: Optional[str] = None,
-) -> RunnableSerializable:
-    """Build a LangChain LCEL chain for a review pass.
-    
-    Constructs: prompt | llm | parser
-    
-    Args:
-        pass_type: One of "defect", "refactor", "compiler", "style"
-        model: Ollama model name. Defaults to MODEL_NAME.
-        
-    Returns:
-        LCEL chain that takes {"file_path", "hunk_text", "commentable_catalog"}
-        and returns List[LLMReviewComment].
-    """
-    from escargot_review_bot.prompts import get_prompt
-    from escargot_review_bot.adapters.parsers import review_comment_list_parser
-    
-    prompt = get_prompt(pass_type)
-    llm = get_cached_llm(model or MODEL_NAME)
-    
-    chain = prompt | llm | review_comment_list_parser
-    logger.debug(f"Built review chain for pass_type={pass_type}, model={model or MODEL_NAME}")
-    return chain
-
-
-def build_judge_chain(
-    model: Optional[str] = None,
-) -> RunnableSerializable:
-    """Build a LangChain LCEL chain for the judge pass.
-    
-    Constructs: prompt | llm | parser
-    
-    Args:
-        model: Ollama model name. Defaults to MODEL_NAME.
-        
-    Returns:
-        LCEL chain that takes {"file_path", "target_code", "proposals_text"}
-        and returns List[JudgeComment].
-    """
-    from escargot_review_bot.prompts import get_prompt
-    from escargot_review_bot.adapters.parsers import judge_comment_list_parser
-    
-    prompt = get_prompt("judge")
-    llm = get_cached_llm(model or MODEL_NAME)
-    
-    chain = prompt | llm | judge_comment_list_parser
-    logger.debug(f"Built judge chain with model={model or MODEL_NAME}")
-    return chain
+# build_review_chain / build_judge_chain were removed when measurement was added.
+# Callers (service.py) now invoke prompt → llm → parser directly so they can
+# capture AIMessage.usage_metadata and per-call latency before parsing.

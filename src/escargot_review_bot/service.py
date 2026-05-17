@@ -1,25 +1,37 @@
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import langsmith as ls
 from fastapi import HTTPException
 from unidiff import PatchSet, Hunk
 
 from escargot_review_bot.adapters.git import run_git_command
-from escargot_review_bot.adapters.llm import build_review_chain, build_judge_chain
+from escargot_review_bot.adapters.llm import get_chat_model
+from escargot_review_bot.adapters.metrics import (
+    MetricsLogger,
+    NullMetricsLogger,
+    extract_usage,
+    new_skip_reason_counter,
+)
+from escargot_review_bot.adapters.parsers import (
+    judge_comment_list_parser,
+    review_comment_list_parser,
+)
 from escargot_review_bot.config.config import (
     ALIGN_SEARCH_WINDOW,
     CONFIDENCE_THRESHOLD,
     DIFF_CONTEXT,
+    EXPERIMENT_LOG_DIR,
+    EXPERIMENT_LOGGING_ENABLED,
     OLLAMA_KEEP_ALIVE,
-    OLLAMA_MODEL_COMPILER,
-    OLLAMA_MODEL_DEFECT,
-    OLLAMA_MODEL_JUDGE,
-    OLLAMA_MODEL_REFACTOR,
-    OLLAMA_MODEL_STYLE,
+    PASS_TYPES,
     REVIEW_INCLUDE_PATHS,
     REVIEW_PARALLEL_PASSES,
     REVIEW_PARALLEL_WORKERS,
+    any_pass_uses_provider,
+    resolve_pass_model,
+    resolve_pass_provider,
 )
 from escargot_review_bot.config.logging import get_logger
 from escargot_review_bot.domain.schemas import (
@@ -27,6 +39,10 @@ from escargot_review_bot.domain.schemas import (
     LLMReviewComment,
     ReviewRequest,
 )
+from escargot_review_bot.prompts import get_prompt
+
+
+MetricsLike = Union[MetricsLogger, NullMetricsLogger]
 
 
 logger = get_logger("review-bot.service")
@@ -339,52 +355,97 @@ def fetch_upstream_with_fallback(pull_request_number: int, base_sha: str, head_s
 
 def _run_review_pass(
     model_type: str,
-    model_name: str,
     file_path: str,
     hunk: Hunk,
     mappings: List[LineMappingLite],
     mapping_dict: Dict[int, Any],
     head_sha: str,
     head_blob_cache: Dict[str, List[str]],
+    metrics: MetricsLike,
+    hunk_id: str,
     skip_ids: Set[int] | None = None,
 ) -> Tuple[List[Dict[str, Any]], Set[int]]:
-    """Run one pass (defect/refactor/compiler/style) using LangChain LCEL chain.
+    """Run one pass (defect/refactor/compiler/style).
 
-    Uses build_review_chain() to construct: prompt | llm | parser
-    Tracing is handled by the parent hunk-level trace.
+    Inlines prompt → llm → parser (instead of using a wrapped LCEL chain) so we
+    can read AIMessage.usage_metadata and time the LLM call itself for paper-
+    grade measurement. Parent hunk-level LangSmith trace is still active.
     """
     chain_input = prepare_chain_input(file_path, hunk, mappings)
-    logger.debug(f"{model_type.title()} pass: model={model_name}")
+    provider = resolve_pass_provider(model_type)
+    model_name = resolve_pass_model(model_type)
+    logger.debug(f"{model_type.title()} pass: provider={provider} model={model_name}")
 
-    chain = build_review_chain(model_type, model=model_name)
-    
+    prompt = get_prompt(model_type)
     try:
-        comments = chain.invoke(chain_input)
+        llm = get_chat_model(model_type)
     except Exception as e:
-        logger.error(f"{model_type} pass: chain invoke failed: {e}")
+        logger.error(f"{model_type} pass: chat model init failed: {e}")
+        metrics.log_llm_call(
+            pass_type=model_type, provider=provider, model=model_name,
+            hunk_id=hunk_id, latency_ms=0, usage={},
+            raw_comments_count=0, error=f"init: {e}",
+        )
         return [], set()
-    
+
+    start = time.perf_counter()
+    try:
+        prompt_value = prompt.invoke(chain_input)
+        ai_message = llm.invoke(prompt_value)
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        logger.error(f"{model_type} pass: LLM invoke failed: {e}")
+        metrics.log_llm_call(
+            pass_type=model_type, provider=provider, model=model_name,
+            hunk_id=hunk_id, latency_ms=latency_ms, usage={},
+            raw_comments_count=0, error=str(e),
+        )
+        return [], set()
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    usage = extract_usage(ai_message)
+
+    try:
+        comments = review_comment_list_parser.invoke(ai_message)
+    except Exception as e:
+        logger.error(f"{model_type} pass: parser failed: {e}")
+        metrics.log_llm_call(
+            pass_type=model_type, provider=provider, model=model_name,
+            hunk_id=hunk_id, latency_ms=latency_ms, usage=usage,
+            raw_comments_count=0, error=f"parse: {e}",
+        )
+        return [], set()
+
     logger.info(f"{model_type} pass: LLM returned {len(comments)} raw comment(s)")
+    metrics.log_llm_call(
+        pass_type=model_type, provider=provider, model=model_name,
+        hunk_id=hunk_id, latency_ms=latency_ms, usage=usage,
+        raw_comments_count=len(comments),
+    )
 
     out_comments: List[Dict[str, Any]] = []
     accepted: Set[int] = set()
+    skips = new_skip_reason_counter()
 
     for llm_comment in comments:
         if skip_ids and llm_comment.target_id in skip_ids:
             logger.debug(f"Skip({model_type}): already accepted id={llm_comment.target_id}")
+            skips["skip_ids"] += 1
             continue
 
         if llm_comment.target_id in accepted:
             logger.debug(f"Skip({model_type}): duplicate target_id={llm_comment.target_id} in this pass")
+            skips["duplicate_in_pass"] += 1
             continue
 
         if llm_comment.confidence < CONFIDENCE_THRESHOLD:
             logger.debug(f"Skip({model_type}): low confidence {llm_comment.confidence:.2f} < {CONFIDENCE_THRESHOLD}")
+            skips["low_confidence"] += 1
             continue
 
         m = mapping_dict.get(llm_comment.target_id)
         if not m or m.line_type != 'added' or m.target_line_no is None:
             logger.debug(f"Skip({model_type}): invalid target_id={llm_comment.target_id} or not added line")
+            skips["invalid_target_id"] += 1
             continue
 
         line_no = m.target_line_no
@@ -410,6 +471,7 @@ def _run_review_pass(
             )
             if aligned is None:
                 logger.debug(f"Skip({model_type}): nearby align failed")
+                skips["align_failed"] += 1
                 continue
             line_no = aligned
 
@@ -430,6 +492,12 @@ def _run_review_pass(
             f"{model_type} pass: all {len(comments)} comment(s) dropped by filters "
             "(confidence/target_id/HEAD alignment). Check LOG_LEVEL=DEBUG for Skip reasons."
         )
+
+    metrics.log_pass_summary(
+        pass_type=model_type, hunk_id=hunk_id,
+        raw_comments=len(comments), accepted=len(out_comments),
+        skip_reasons=skips,
+    )
     return out_comments, accepted
 
 
@@ -441,8 +509,13 @@ def _merge_comments_by_line(
     refactor_comments: List[Dict[str, Any]],
     compiler_comments: List[Dict[str, Any]],
     style_comments: List[Dict[str, Any]],
+    metrics: MetricsLike,
+    hunk_id: str,
 ) -> List[Dict[str, Any]]:
-    """Groups by (path, line). Uses Judge chain to merge multiple pass comments."""
+    """Group by (path, line) and use the Judge pass to merge proposals.
+
+    Each Judge round-trip is measured (latency + usage) via `metrics.log_judge_call`.
+    """
     fp, h, m, mapping_dict = hunk_item
     key_to_bodies: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for label, comments in [
@@ -462,16 +535,23 @@ def _merge_comments_by_line(
             body = (c.get("body") or "").strip()
             if body:
                 key_to_bodies[key]["parts"].append((label, body))
-                
+
     merged: List[Dict[str, Any]] = []
-    judge_chain = build_judge_chain(model=OLLAMA_MODEL_JUDGE)
-    
+    judge_provider = resolve_pass_provider("judge")
+    judge_model = resolve_pass_model("judge")
+    judge_prompt = get_prompt("judge")
+    try:
+        judge_llm = get_chat_model("judge")
+    except Exception as e:
+        logger.error(f"Judge chat model init failed: {e}")
+        return merged
+
     for key in sorted(key_to_bodies.keys()):
         info = key_to_bodies[key]
         parts = info["parts"]
         if not parts:
             continue
-            
+
         target_code = "(Failed to map the line)"
         for mapping in m:
             if mapping.target_line_no == info["line"]:
@@ -480,29 +560,66 @@ def _merge_comments_by_line(
 
         order_idx = {p: i for i, p in enumerate(_PASS_ORDER)}
         parts_sorted = sorted(parts, key=lambda x: order_idx.get(x[0], 99))
-        
+        proposals_passes = [p for p, _ in parts_sorted]
+
         proposals_text = ""
         for p_label, b_text in parts_sorted:
             proposals_text += f"[{p_label.upper()}]\n{b_text}\n\n"
-            
+
         logger.debug(f"Judge pass starting for {info['path']}:{info['line']} (proposals: {len(parts)})")
-        
+
+        start = time.perf_counter()
         try:
-            judge_comments = judge_chain.invoke({
+            prompt_value = judge_prompt.invoke({
                 "file_path": info["path"],
                 "target_code": target_code,
                 "proposals_text": proposals_text.strip(),
             })
+            ai_message = judge_llm.invoke(prompt_value)
         except Exception as e:
-            logger.error(f"Judge chain invoke failed: {e}")
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            logger.error(f"Judge invoke failed: {e}")
+            metrics.log_judge_call(
+                provider=judge_provider, model=judge_model,
+                hunk_id=hunk_id, line=info["line"],
+                proposals_count=len(parts), proposals_passes=proposals_passes,
+                merged_count=0, latency_ms=latency_ms, usage={}, error=str(e),
+            )
             continue
-        
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        usage = extract_usage(ai_message)
+
+        try:
+            judge_comments = judge_comment_list_parser.invoke(ai_message)
+        except Exception as e:
+            logger.error(f"Judge parser failed: {e}")
+            metrics.log_judge_call(
+                provider=judge_provider, model=judge_model,
+                hunk_id=hunk_id, line=info["line"],
+                proposals_count=len(parts), proposals_passes=proposals_passes,
+                merged_count=0, latency_ms=latency_ms, usage=usage,
+                error=f"parse: {e}",
+            )
+            continue
+
         if not judge_comments:
             logger.debug(f"Judge pass rejected proposals for {info['line']}.")
+            metrics.log_judge_call(
+                provider=judge_provider, model=judge_model,
+                hunk_id=hunk_id, line=info["line"],
+                proposals_count=len(parts), proposals_passes=proposals_passes,
+                merged_count=0, latency_ms=latency_ms, usage=usage,
+            )
             continue
-            
+
         judged_comment = judge_comments[0].body.strip()
         if not judged_comment:
+            metrics.log_judge_call(
+                provider=judge_provider, model=judge_model,
+                hunk_id=hunk_id, line=info["line"],
+                proposals_count=len(parts), proposals_passes=proposals_passes,
+                merged_count=0, latency_ms=latency_ms, usage=usage,
+            )
             continue
 
         merged.append({
@@ -512,6 +629,12 @@ def _merge_comments_by_line(
             "line": info["line"],
             "side": info["side"],
         })
+        metrics.log_judge_call(
+            provider=judge_provider, model=judge_model,
+            hunk_id=hunk_id, line=info["line"],
+            proposals_count=len(parts), proposals_passes=proposals_passes,
+            merged_count=1, latency_ms=latency_ms, usage=usage,
+        )
     return merged
 
 
@@ -603,27 +726,40 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
         return []
 
     workers = max(1, REVIEW_PARALLEL_WORKERS)
-    if OLLAMA_KEEP_ALIVE == "0" and workers > 1:
+    if OLLAMA_KEEP_ALIVE == "0" and workers > 1 and any_pass_uses_provider("ollama"):
         logger.info(
-            f"OLLAMA_KEEP_ALIVE=0: forcing workers=1 to avoid model unload race (was {workers})."
+            f"OLLAMA_KEEP_ALIVE=0 with an ollama pass: forcing workers=1 to avoid model unload race (was {workers})."
         )
         workers = 1
 
+    provider_breakdown: Dict[str, str] = {
+        p: f"{resolve_pass_provider(p)}:{resolve_pass_model(p)}" for p in PASS_TYPES
+    }
     use_parallel_passes = REVIEW_PARALLEL_PASSES
+    models_info = ", ".join(f"{p}={provider_breakdown[p]}" for p in PASS_TYPES)
     if use_parallel_passes:
-        models_info = (
-            f"defect={OLLAMA_MODEL_DEFECT}, "
-            f"refactor={OLLAMA_MODEL_REFACTOR}, "
-            f"compiler={OLLAMA_MODEL_COMPILER}, "
-            f"style={OLLAMA_MODEL_STYLE}"
-        )
         logger.info(
             f"Parallel passes enabled: [{models_info}], "
             f"{len(hunk_items)} hunks × 4 passes = {4 * len(hunk_items)} tasks, "
             f"max_workers={min(4 * workers, 4 * len(hunk_items))}."
         )
     else:
-        logger.info(f"Sequential review: {len(hunk_items)} hunks, {workers} workers per pass.")
+        logger.info(f"Sequential review: [{models_info}], {len(hunk_items)} hunks, {workers} workers per pass.")
+
+    if EXPERIMENT_LOGGING_ENABLED:
+        import os as _os
+        provider_summary = "-".join(
+            sorted({resolve_pass_provider(p) for p in PASS_TYPES})
+        )
+        metrics: MetricsLike = MetricsLogger(
+            pr_number=request.pull_request_number,
+            provider_summary=provider_summary,
+            output_dir=EXPERIMENT_LOG_DIR,
+            label=_os.getenv("EXPERIMENT_LABEL") or None,
+        )
+        logger.info(f"Experiment log: {metrics.path}")
+    else:
+        metrics = NullMetricsLogger()
 
     def get_hunk_line_range(hunk: Hunk) -> str:
         """Get line range string for hunk (e.g., 'L42-L58')."""
@@ -657,41 +793,43 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
         ) as hunk_run:
             defect_comments, defect_ids = _run_review_pass(
                 model_type="defect",
-                model_name=OLLAMA_MODEL_DEFECT,
                 file_path=fp, hunk=h, mappings=m, mapping_dict=md,
                 head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                metrics=metrics, hunk_id=trace_name,
             )
-            
+
             refactor_comments, refactor_ids = _run_review_pass(
                 model_type="refactor",
-                model_name=OLLAMA_MODEL_REFACTOR,
                 file_path=fp, hunk=h, mappings=m, mapping_dict=md,
                 head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                metrics=metrics, hunk_id=trace_name,
                 skip_ids=defect_ids,
             )
-            
+
             compiler_comments, _ = _run_review_pass(
                 model_type="compiler",
-                model_name=OLLAMA_MODEL_COMPILER,
                 file_path=fp, hunk=h, mappings=m, mapping_dict=md,
                 head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                metrics=metrics, hunk_id=trace_name,
                 skip_ids=defect_ids | refactor_ids,
             )
-            
+
             style_comments, _ = _run_review_pass(
                 model_type="style",
-                model_name=OLLAMA_MODEL_STYLE,
                 file_path=fp, hunk=h, mappings=m, mapping_dict=md,
                 head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                metrics=metrics, hunk_id=trace_name,
                 skip_ids=defect_ids | refactor_ids,
             )
-            
+
             merged = _merge_comments_by_line(
                 hunk_items[i],
                 defect_comments,
                 refactor_comments,
                 compiler_comments,
                 style_comments,
+                metrics=metrics,
+                hunk_id=trace_name,
             )
             
             hunk_run.end(outputs={
@@ -705,25 +843,35 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
             return merged
 
     all_github_comments: List[Dict[str, Any]] = []
-    
-    if use_parallel_passes:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_idx = {
-                executor.submit(run_single_hunk, i): i
-                for i in range(len(hunk_items))
-            }
-            for future in as_completed(future_to_idx):
-                hunk_idx = future_to_idx[future]
+
+    try:
+        if use_parallel_passes:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_idx = {
+                    executor.submit(run_single_hunk, i): i
+                    for i in range(len(hunk_items))
+                }
+                for future in as_completed(future_to_idx):
+                    hunk_idx = future_to_idx[future]
+                    try:
+                        all_github_comments.extend(future.result())
+                    except Exception as e:
+                        logger.exception(f"Hunk {hunk_idx} review failed: {e}")
+        else:
+            for i in range(len(hunk_items)):
                 try:
-                    all_github_comments.extend(future.result())
+                    all_github_comments.extend(run_single_hunk(i))
                 except Exception as e:
-                    logger.exception(f"Hunk {hunk_idx} review failed: {e}")
-    else:
-        for i in range(len(hunk_items)):
-            try:
-                all_github_comments.extend(run_single_hunk(i))
-            except Exception as e:
-                logger.exception(f"Hunk {i} review failed: {e}")
+                    logger.exception(f"Hunk {i} review failed: {e}")
+    finally:
+        try:
+            metrics.finalize(
+                total_hunks=len(hunk_items),
+                total_comments_posted=len(all_github_comments),
+                provider_breakdown=provider_breakdown,
+            )
+        except Exception as e:
+            logger.warning(f"Metrics finalize failed: {e}")
 
     logger.info(f"Generated {len(all_github_comments)} comments (hunks={len(hunk_items)}, parallel={use_parallel_passes}).")
     return all_github_comments
