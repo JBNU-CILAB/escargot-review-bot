@@ -391,7 +391,7 @@ def _run_review_pass(
     start = time.perf_counter()
     try:
         prompt_value = prompt.invoke(chain_input)
-        ai_message = llm.invoke(prompt_value)
+        ai_message = llm.invoke(prompt_value, config={"run_name": f"ChatOpenAI_{model_type.capitalize()}_Pass"})
     except Exception as e:
         latency_ms = int((time.perf_counter() - start) * 1000)
         logger.error(f"{model_type} pass: LLM invoke failed: {e}")
@@ -575,7 +575,7 @@ def _merge_comments_by_line(
                 "target_code": target_code,
                 "proposals_text": proposals_text.strip(),
             })
-            ai_message = judge_llm.invoke(prompt_value)
+            ai_message = judge_llm.invoke(prompt_value, config={"run_name": "ChatOpenAI_Judge_Pass"})
         except Exception as e:
             latency_ms = int((time.perf_counter() - start) * 1000)
             logger.error(f"Judge invoke failed: {e}")
@@ -845,20 +845,23 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
     all_github_comments: List[Dict[str, Any]] = []
 
     try:
+        hunk_indices = list(range(len(hunk_items)))
         if use_parallel_passes:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_to_idx = {
-                    executor.submit(run_single_hunk, i): i
-                    for i in range(len(hunk_items))
-                }
-                for future in as_completed(future_to_idx):
-                    hunk_idx = future_to_idx[future]
-                    try:
-                        all_github_comments.extend(future.result())
-                    except Exception as e:
-                        logger.exception(f"Hunk {hunk_idx} review failed: {e}")
+            chunks = [hunk_indices[i:i + workers] for i in range(0, len(hunk_indices), workers)]
+            for chunk_idx, chunk in enumerate(chunks):
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    future_to_idx = {executor.submit(run_single_hunk, i): i for i in chunk}
+                    for future in as_completed(future_to_idx):
+                        hunk_idx = future_to_idx[future]
+                        try:
+                            all_github_comments.extend(future.result())
+                        except Exception as e:
+                            logger.exception(f"Hunk {hunk_idx} review failed: {e}")
+                if chunk_idx < len(chunks) - 1:
+                    logger.info(f"Batch {chunk_idx + 1}/{len(chunks)} done. Sleeping 90s (TPM rate limit)...")
+                    time.sleep(90)
         else:
-            for i in range(len(hunk_items)):
+            for i in hunk_indices:
                 try:
                     all_github_comments.extend(run_single_hunk(i))
                 except Exception as e:
