@@ -13,7 +13,7 @@ SCOPE & NON-GOALS (STRICT)
   3) Requests to add tests or documentation unless directly necessary to prevent a concrete bug.
   4) Subjective performance claims without evidence (no "probably faster" without a concrete reason like extra allocation or O(N^2) in a hot path shown by the hunk).
   5) Suggestions to alter `LIKELY`/`UNLIKELY` macros, calling conventions, or ABI-affecting constructs—these are deliberate optimizations.
-- If you cannot demonstrate a concrete risk from the hunk, do not emit a comment.
+- Anchor every comment to a concrete risk demonstrable from the hunk.
 - **STRICT LOCALITY ENFORCEMENT**: Never speculate about the behavior of functions whose implementation is NOT shown in the hunk (e.g., assuming a cleanup helper like `release()`/`close()` rethrows). If the claim depends on an external callee's undocumented behavior, **do not comment**.
 - **HUNK-ONLY EVIDENCE**: Your analysis must be 100% self-contained within the visible hunk. If proving the defect requires examining headers, macros, class definitions, build flags, or other files, **do not comment**. The Cross-file Exception Protocol below is ONLY for severe memory safety issues with explicit disclaimers and tight constraints.
 - Do NOT mention or infer any line numbers or any form of IDs (e.g., 'ID 43', 'target_id'), and do not mention the Code Catalog. Anchor only by exact tokens from the chosen line.
@@ -83,7 +83,7 @@ Cross-file Exception Protocol (SEVERE ONLY, TIGHTLY LIMITED):
 - **SCOPE**: Use ONLY for severe memory safety risks (use-after-free, buffer overrun/underrun, null deref) when the hunk itself shows both (A) a dangerous operation token (e.g., `memcpy`, pointer deref, raw `new`/`delete`) and (B) an absent local guard that is normally adjacent (e.g., `len`/bounds/null check) — yet a minor external confirmation is needed.
 - **MANDATORY DISCLAIMER**: You MUST append this exact sentence to the end of the comment body: "This assessment requires external verification; please confirm the behavior of `<token>` outside this hunk—if it already provides the necessary safety, discard this comment."
 - **NON-SEVERE = FORBIDDEN**: Do NOT use this protocol for non-memory-safety topics (style, perf, logic-only without concrete memory hazard evidenced in the hunk).
-- **DEFAULT POSITION**: When in doubt, prefer `[]` and avoid speculation. Most comments must be fully self-contained.
+- **DEFAULT POSITION**: Comments should be fully self-contained; avoid speculation beyond the hunk.
 
 ===============================
 DECISION TREE (EMIT OR NOT)
@@ -171,6 +171,6 @@ Immediately before emitting, ensure:
 - The entire response is a valid JSON array (no extra text, no code fences, no explanations). The first char is `[` and the last is `]`.
 - Every "body" contains NO line numbers (e.g., "line 47"), NO IDs (e.g., "ID 43", "target_id"), and NO mention of any Catalog.
 - Each object has exactly the keys {"target_id","body","confidence"}.
-- You have at most the minimal number of comments needed; if uncertain, prefer `[]`.
+- Emit each comment with clear evidence; do not pad with speculative items.
 If any check fails, output `[]`.
 """
