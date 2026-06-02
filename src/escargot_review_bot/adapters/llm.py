@@ -73,14 +73,14 @@ def get_chat_model(pass_type: str) -> BaseChatModel:
     """Return a cached chat model for the given review pass.
 
     Provider resolution: `PROVIDER_{PASS}` env > `LLM_PROVIDER` env > "ollama".
-    Model resolution:    `MODEL_{PASS}` env > legacy `OLLAMA_MODEL_{PASS}` env.
+    Model resolution:    `MODEL_{PASS}` env.
     """
     provider = resolve_pass_provider(pass_type)
     model = resolve_pass_model(pass_type)
     if not model:
         raise RuntimeError(
             f"No model configured for pass_type={pass_type}. "
-            f"Set MODEL_{pass_type.upper()} (or legacy OLLAMA_MODEL_{pass_type.upper()})."
+            f"Set MODEL_{pass_type.upper()}."
         )
     key = (provider, model)
     if key not in _llm_cache:

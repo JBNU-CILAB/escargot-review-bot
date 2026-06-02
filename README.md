@@ -1,24 +1,24 @@
 # Escargot Review Bot
-A self‑hosted review server with GitHub Actions integration that generates automated code‑review comments for pull requests in the Escargot (lightweight ECMAScript engine) repository. It provides a Parallel Four-Pass LLM Review (Defects, Compiler, Refactors, Style), intelligent Judge Aggregation, robust line anchoring, and incremental review‑on‑push behavior, all powered by the LangChain framework.
+A self‑hosted review server with GitHub Actions integration that generates automated code‑review comments for pull requests in the Escargot (lightweight ECMAScript engine) repository. It provides a Four-Pass LLM Review (Defect, Refactor, Compiler, Style — sequential within each hunk, parallel across hunks), intelligent Judge Aggregation, robust line anchoring, and incremental review‑on‑push behavior, all powered by the LangChain framework.
 
 ## Purpose
 Built to shorten review time and reduce feedback latency so contributors can submit PRs confidently and receive an early quality signal (typically within minutes). When a PR is created or updated, only the changed lines are analyzed to propose concrete defect and refactoring candidates, with comments precisely anchored to newly added lines as evidence.
 
-The pipeline concurrently executes 4 specialized passes—Defect, Compiler, Refactor, and Style—without blocking each other. Redundant or conflicting feedback on the same lines is merged intelligently via a Judge pass to prevent self-confirmation bias. Everything runs on a local LLM and a self-hosted runner for speed and cost efficiency, and integrates cleanly with GitHub Actions.
+For each hunk, the pipeline runs 4 specialized passes **sequentially** (Defect → Refactor → Compiler → Style) so that lower-priority passes can skip lines already flagged by higher-priority passes. Hunks themselves are processed in parallel (`REVIEW_PARALLEL_WORKERS`). Any residual overlap on the same `(path, line)` is then merged by a Judge pass to prevent self-confirmation bias. Runs on either a local LLM (Ollama) or OpenAI, integrates cleanly with GitHub Actions, and is suited for self-hosted runners.
 
 - Generates reviews tailored specifically for the lightweight JavaScript engine Escargot.
  - Analyze PR diffs to automatically propose defect and improvement candidates across 4 diverse perspectives.
 - Generate safe, well-grounded comments anchored to newly added lines.
-- **Judge Aggregation:** Merges multiple comments targeting the same line based on priority (Defect ≥ Compiler ≥ Refactor, Style).
-- Leverage a local LLM (Ollama) with LangChain for stable, parallel executions and cost-efficient reviews.
+- **Judge Aggregation:** Merges multiple comments targeting the same line based on priority (Defect ≥ Refactor ≥ {Compiler, Style}).
+- Leverage a local LLM (Ollama) with LangChain for stable, hunk-parallel executions and cost-efficient reviews.
 - **LangSmith Tracing:** Systematically tracks PR review data to continuously analyze vulnerabilities and improve bot accuracy.
 - Integrate seamlessly with GitHub Actions to post comments.
 
 ## Key features
-- Multiplexed Parallel Review
-  - Hunk‑scoped prompts evaluated concurrently across Defect, Compiler, Refactor, and Style passes, significantly reducing overall review time and eliminating legacy `skip_ids` blockers.
-- Judge Aggregation & Bias Mitigation
-  - If multiple passes target the same line, a dedicated Judge model aggregates them into a single concise comment respecting priority. The Judge uses an independent evaluation structure to mitigate self-confirmation bias.
+- Sequential four-pass review per hunk (parallel across hunks)
+  - Each hunk runs Defect → Refactor → Compiler → Style **sequentially** (the order also conveys priority to the Judge). Hunks themselves are processed in parallel via `REVIEW_PARALLEL_WORKERS`.
+- Judge-merge redundancy suppression
+  - The Judge pass merges any `(path, line)` overlap between passes into a single comment via an independent evaluation, mitigating self-confirmation bias. Priority `Defect ≥ Refactor ≥ {Compiler, Style}` is communicated to the Judge by sorting proposals in pass order.
 - Robust line anchoring (against HEAD)
   - Exact match → windowed nearby search (±`ALIGN_SEARCH_WINDOW`) → ±2‑line context tiebreaker; HEAD blobs cached per `{sha}:{path}`
 - Incremental review (workflow integration)
@@ -29,8 +29,8 @@ The pipeline concurrently executes 4 specialized passes—Defect, Compiler, Refa
   - LLM orchestration migrated to standard LangChain, enabling detailed LangSmith tracing for vulnerability analysis and easy integration of new LLM providers.
 - Git and error handling
   - Map git subprocess failures to HTTP 500; rich debug logs for traceability
-- Performance and timeouts
-  - Tunable parallel workers (`REVIEW_PARALLEL_WORKERS`), timeouts (`OLLAMA_TIMEOUT_SECONDS`), and `INTER_REQUEST_DELAY_SECONDS`.
+- Performance
+  - Tunable hunk-parallel workers (`REVIEW_PARALLEL_WORKERS`). Note: `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_MAX_RETRIES`, and `INTER_REQUEST_DELAY_SECONDS` apply only to the legacy `chat_and_parse` path and are **not** wired into the current `ChatOllama` / `ChatOpenAI` pipeline.
 
 ## Architecture overview
 ```text
@@ -47,22 +47,23 @@ The pipeline concurrently executes 4 specialized passes—Defect, Compiler, Refa
    ├─ git diff -U{DIFF_CONTEXT} base head
    ├─ Parse PatchSet (unidiff)
    ├─ For each file filtered by REVIEW_INCLUDE_PATHS
-   │    └─ For each hunk
+   │    └─ For each hunk (hunks parallelized via REVIEW_PARALLEL_WORKERS)
    │         ├─ create_line_mappings_for_hunk → target_id indexing
    │         ├─ build_hunk_based_prompt (added lines only)
-   │         ├─ Parallel LLM Executions (LangChain):
+   │         ├─ Sequential LLM Passes (LangChain), independent per pass:
    │         │    ├─ Defect Pass
-   │         │    ├─ Compiler Pass
    │         │    ├─ Refactor Pass
+   │         │    ├─ Compiler Pass
    │         │    └─ Style Pass
-   │         ├─ Judge Pass: Aggregate overlapping comments (Priority: Defect ≥ Compiler ≥ Refactor, Style)
+   │         ├─ Judge Pass: merge overlapping (path, line) comments
+   │         │                 Priority: Defect ≥ Refactor ≥ {Compiler, Style}
    │         └─ HEAD alignment → nearby search(±ALIGN_SEARCH_WINDOW)
    │              → ±2-line context tiebreaker → GitHubComment(line/side)
    └─ Return {comments: [...]}
 
 [Adapters & Observability]
    • Git: run_git_command (diff/show/fetch), HEAD blob cache
-   • LLM Orchestration: LangChain (JSON parsing, parallel retries)
+   • LLM Orchestration: LangChain chat models (ChatOllama / ChatOpenAI), JSON parsing
    • Tracing: LangSmith (Performance & Vulnerability Analysis tracking)
 ```
 
@@ -71,9 +72,9 @@ The pipeline concurrently executes 4 specialized passes—Defect, Compiler, Refa
 2) The server syncs upstream and runs `git diff -U{DIFF_CONTEXT}` to produce a unified diff.
 3) Parse the PatchSet with `unidiff`, then iterate per file/hunk (paths limited by `REVIEW_INCLUDE_PATHS`).
 4) For each hunk, collect only `added` lines into a catalog (unique `target_id`) and build the prompt.
-5) Call the LLM concurrently for the 4 passes: Defect, Compiler, Refactor, and Style using LangChain.
+5) Call the LLM for 4 sequential passes within the hunk (Defect → Refactor → Compiler → Style) using LangChain. The passes run independently; redundancy on the same `(path, line)` is collapsed downstream by the Judge. Different hunks run in parallel.
 6) Valid JSON arrays are extracted, parsed, and validated via Pydantic schema models.
-7) Judge pass: Comments generated from different passes targeting the same `target_id` are passed to the Judge model. The Judge evaluates and merges them into a highly readable single comment based on predefined priorities, effectively preventing self-confirmation bias.
+7) Judge pass: Comments from different passes that resolve to the same `(path, line)` are grouped and passed to the Judge model. The Judge evaluates and merges them into a single readable comment based on predefined priorities (Defect ≥ Refactor ≥ {Compiler, Style}), effectively preventing self-confirmation bias.
 8) Line anchoring: if exact HEAD alignment fails, search nearby (±`ALIGN_SEARCH_WINDOW`), then use ±2-line context to pick a unique candidate.
 9) Convert valid items to `GitHubComment` with `commit_id/path/line/side` and accumulate.
 10) Return `{comments:[...]}` to Actions, which posts PR review comments.
@@ -90,10 +91,10 @@ The pipeline concurrently executes 4 specialized passes—Defect, Compiler, Refa
 - Confidence threshold: suggestions below `CONFIDENCE_THRESHOLD` are dropped.
 - Path scoping: only files under `REVIEW_INCLUDE_PATHS` are considered.
 - HEAD anchoring: exact match first, then nearby search (±`ALIGN_SEARCH_WINDOW`) with ±2-line context tiebreaker; ambiguous matches are skipped.
-- Judge Pass Validation: Replaces legacy cross-pass de-duplication. Prevents redundant feedback and maintains objectivity by using an independent judgment evaluation instead of directly trusting individual pass outputs.
+- Judge-merge redundancy suppression: the Judge pass merges any `(path, line)` overlap between passes using an independent evaluation, mitigating self-confirmation bias. Pass priority `Defect ≥ Refactor ≥ {Compiler, Style}` is conveyed by the order proposals are presented to the Judge.
 - Git safety: subprocess failures mapped to HTTP 500; upstream fetch with fallbacks; HEAD blobs cached per `{sha}:{path}`.
 - Concurrency guard (workflow): per-PR group with `cancel-in-progress: true` cancels older runs on new pushes.
-- LLM robustness: LangChain automatically handles parsing failures, retries (`OLLAMA_MAX_RETRIES`), and timeouts (`OLLAMA_TIMEOUT_SECONDS`).
+- LLM robustness: pass-level failures (LLM invoke errors, JSON parse failures, Pydantic validation errors) are logged and skipped — one bad hunk returns an empty comment list rather than aborting the whole review. The chat models built by `_build_chat_model` do **not** set request timeouts; `OLLAMA_TIMEOUT_SECONDS` / `OLLAMA_MAX_RETRIES` apply only to the legacy `chat_and_parse` path, which the current pipeline does not invoke.
 
 ## Requirements
 - Python 3.11+ (tested on 3.12)
@@ -168,10 +169,11 @@ sudo systemctl restart escargot-review-bot
 | `REVIEW_PARALLEL_WORKERS`| `3` | Number of parallel workers for hunk concurrency. |
 | `REVIEW_PARALLEL_PASSES` | `true` | Enables parallel execution for Defect, Compiler, Refactor, and Style passes. |
 | `OLLAMA_KEEP_ALIVE` | `30m` | Keeps the model loaded in memory for the specified duration. |
-| `OLLAMA_MODEL_DEFECT` | `model-name` | Model used for the Defect pass. |
-| `OLLAMA_MODEL_REFACTOR` | `model-name` | Model used for the Refactor pass. |
-| `OLLAMA_MODEL_COMPILER` | `model-name` | Model used for the Compiler pass. |
-| `OLLAMA_MODEL_STYLE` | `model-name` | Model used for the Style pass. |
+| `MODEL_DEFECT` | `model-name` | Model used for the Defect pass (provider-agnostic). |
+| `MODEL_REFACTOR` | `model-name` | Model used for the Refactor pass (provider-agnostic). |
+| `MODEL_COMPILER` | `model-name` | Model used for the Compiler pass (provider-agnostic). |
+| `MODEL_STYLE` | `model-name` | Model used for the Style pass (provider-agnostic). |
+| `MODEL_JUDGE` | `model-name` | Model used for the Judge merge pass (provider-agnostic). |
 | `OLLAMA_TEMPERATURE` | `0.1` | Sampling temperature for the LLM. |
 | `OLLAMA_NUM_CTX` | `8192` | Context window size passed to Ollama. |
 | `OLLAMA_NUM_BATCH` | `256` | Batch size for Ollama generation. |

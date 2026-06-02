@@ -363,8 +363,7 @@ def _run_review_pass(
     head_blob_cache: Dict[str, List[str]],
     metrics: MetricsLike,
     hunk_id: str,
-    skip_ids: Set[int] | None = None,
-) -> Tuple[List[Dict[str, Any]], Set[int]]:
+) -> List[Dict[str, Any]]:
     """Run one pass (defect/refactor/compiler/style).
 
     Inlines prompt → llm → parser (instead of using a wrapped LCEL chain) so we
@@ -386,7 +385,7 @@ def _run_review_pass(
             hunk_id=hunk_id, latency_ms=0, usage={},
             raw_comments_count=0, error=f"init: {e}",
         )
-        return [], set()
+        return []
 
     start = time.perf_counter()
     try:
@@ -400,7 +399,7 @@ def _run_review_pass(
             hunk_id=hunk_id, latency_ms=latency_ms, usage={},
             raw_comments_count=0, error=str(e),
         )
-        return [], set()
+        return []
     latency_ms = int((time.perf_counter() - start) * 1000)
     usage = extract_usage(ai_message)
 
@@ -413,7 +412,7 @@ def _run_review_pass(
             hunk_id=hunk_id, latency_ms=latency_ms, usage=usage,
             raw_comments_count=0, error=f"parse: {e}",
         )
-        return [], set()
+        return []
 
     logger.info(f"{model_type} pass: LLM returned {len(comments)} raw comment(s)")
     metrics.log_llm_call(
@@ -427,11 +426,6 @@ def _run_review_pass(
     skips = new_skip_reason_counter()
 
     for llm_comment in comments:
-        if skip_ids and llm_comment.target_id in skip_ids:
-            logger.debug(f"Skip({model_type}): already accepted id={llm_comment.target_id}")
-            skips["skip_ids"] += 1
-            continue
-
         if llm_comment.target_id in accepted:
             logger.debug(f"Skip({model_type}): duplicate target_id={llm_comment.target_id} in this pass")
             skips["duplicate_in_pass"] += 1
@@ -498,7 +492,7 @@ def _run_review_pass(
         raw_comments=len(comments), accepted=len(out_comments),
         skip_reasons=skips,
     )
-    return out_comments, accepted
+    return out_comments
 
 
 _PASS_ORDER = ("defect", "refactor", "compiler", "style")
@@ -791,35 +785,32 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
                 "target_length": h.target_length,
             },
         ) as hunk_run:
-            defect_comments, defect_ids = _run_review_pass(
+            defect_comments = _run_review_pass(
                 model_type="defect",
                 file_path=fp, hunk=h, mappings=m, mapping_dict=md,
                 head_sha=request.head_sha, head_blob_cache=head_blob_cache,
                 metrics=metrics, hunk_id=trace_name,
             )
 
-            refactor_comments, refactor_ids = _run_review_pass(
+            refactor_comments = _run_review_pass(
                 model_type="refactor",
                 file_path=fp, hunk=h, mappings=m, mapping_dict=md,
                 head_sha=request.head_sha, head_blob_cache=head_blob_cache,
                 metrics=metrics, hunk_id=trace_name,
-                skip_ids=defect_ids,
             )
 
-            compiler_comments, _ = _run_review_pass(
+            compiler_comments = _run_review_pass(
                 model_type="compiler",
                 file_path=fp, hunk=h, mappings=m, mapping_dict=md,
                 head_sha=request.head_sha, head_blob_cache=head_blob_cache,
                 metrics=metrics, hunk_id=trace_name,
-                skip_ids=defect_ids | refactor_ids,
             )
 
-            style_comments, _ = _run_review_pass(
+            style_comments = _run_review_pass(
                 model_type="style",
                 file_path=fp, hunk=h, mappings=m, mapping_dict=md,
                 head_sha=request.head_sha, head_blob_cache=head_blob_cache,
                 metrics=metrics, hunk_id=trace_name,
-                skip_ids=defect_ids | refactor_ids,
             )
 
             merged = _merge_comments_by_line(

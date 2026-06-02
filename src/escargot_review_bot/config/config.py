@@ -47,12 +47,8 @@ def resolve_pass_provider(pass_type: str) -> str:
 
 
 def resolve_pass_model(pass_type: str) -> str:
-    """Resolve model for a pass: MODEL_* first, then legacy OLLAMA_MODEL_* fallback."""
-    return (
-        os.getenv(f"MODEL_{pass_type.upper()}")
-        or os.getenv(f"OLLAMA_MODEL_{pass_type.upper()}")
-        or ""
-    )
+    """Resolve model for a pass from MODEL_{PASS} env."""
+    return os.getenv(f"MODEL_{pass_type.upper()}") or ""
 
 
 def any_pass_uses_provider(provider: str) -> bool:
@@ -62,11 +58,6 @@ def any_pass_uses_provider(provider: str) -> bool:
 
 # Ollama configuration
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")
-OLLAMA_MODEL_DEFECT = os.getenv("OLLAMA_MODEL_DEFECT", "qwen3-coder:30b")
-OLLAMA_MODEL_REFACTOR = os.getenv("OLLAMA_MODEL_REFACTOR", "qwen3-coder:30b")
-OLLAMA_MODEL_COMPILER = os.getenv("OLLAMA_MODEL_COMPILER", "qwen3-coder:30b")
-OLLAMA_MODEL_STYLE = os.getenv("OLLAMA_MODEL_STYLE", "qwen3-coder:30b")
-OLLAMA_MODEL_JUDGE = os.getenv("OLLAMA_MODEL_JUDGE", "gpt-oss:20b")
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "0")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "")  # e.g. http://127.0.0.1:7777; empty → ChatOllama default (11434)
 

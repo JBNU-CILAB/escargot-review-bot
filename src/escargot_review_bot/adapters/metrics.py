@@ -27,7 +27,6 @@ from typing import Any, Dict, List, Optional
 
 
 SKIP_REASONS = (
-    "skip_ids",
     "duplicate_in_pass",
     "low_confidence",
     "invalid_target_id",
