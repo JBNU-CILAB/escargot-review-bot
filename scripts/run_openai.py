@@ -11,6 +11,11 @@
 
     # 모델 변경
     python scripts/run_openai.py --model gpt-4o-mini
+    
+    # 처리 모드 지정
+    python scripts/run_openai.py --mode sequential   
+    python scripts/run_openai.py --mode hunk         
+    python scripts/run_openai.py --mode pass        
 
 결과 파일 (experiments/ 디렉토리)
 ---------------------------------
@@ -67,6 +72,13 @@ def run_one(pr: int, base: str, head: str, model: str) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="gpt-4o", help="OpenAI model (default: gpt-4o)")
+    parser.add_argument(
+        "--mode",
+        choices=("sequential", "hunk", "pass"),
+        default="sequential",
+        help="REVIEW_PARALLELISM 실행 모드 (default: sequential). "
+             "LangSmith 프로젝트명 PR-{n}-{mode}-{provider}에 반영됨.",
+    )
     args = parser.parse_args()
 
     # OpenAI 강제 설정
@@ -75,9 +87,12 @@ def main() -> int:
         os.environ[key] = "openai" if key == "LLM_PROVIDER" else args.model
     os.environ["EXPERIMENT_LABEL"] = f"openai-{args.model}"
     os.environ["REVIEW_PARALLEL_WORKERS"] = "1"  # rate limit 방지
+    # config 가 처음 import 되기 전(run_one 호출 전)에 세팅해야 REVIEW_PARALLELISM
+    # 기본값(hunk)이 아니라 선택한 모드로 고정되고, 프로젝트명에도 반영된다.
+    os.environ["REVIEW_PARALLELISM"] = args.mode
 
     total = len(EXPERIMENTS)
-    print(f"[run_openai] 총 {total}개 PR 실험 시작  model={args.model}")
+    print(f"[run_openai] 총 {total}개 PR 실험 시작  model={args.model}  mode={args.mode}")
     print(f"[run_openai] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
