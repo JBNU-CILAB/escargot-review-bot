@@ -661,7 +661,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
     
     try:
         with ls.tracing_context(project_name=pr_project_name):
-            return _execute_review(request)
+            return _execute_review(request, pr_project_name)
     finally:
         # 원래 값 복원
         if old_project is not None:
@@ -670,8 +670,16 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             os.environ.pop("LANGCHAIN_PROJECT", None)
 
 
-def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
-    """Internal implementation of the review logic."""
+def _execute_review(request: ReviewRequest, pr_project_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Internal implementation of the review logic.
+
+    `pr_project_name` is passed explicitly to every `ls.trace` so that hunk/pass
+    modes — whose traces are opened inside ThreadPoolExecutor worker threads —
+    bind to the correct per-PR project. contextvars (and thus the project set by
+    `ls.tracing_context` in the caller) do NOT propagate into worker threads, so
+    without an explicit project_name every worker-thread trace collapses onto the
+    first PR's project. None falls back to the ambient context (main-thread paths).
+    """
     # Fetch upstream refs and ensure base/head SHAs are available locally
     logger.info("Fetching latest data from upstream...")
     fetch_upstream_with_fallback(request.pull_request_number, request.base_sha, request.head_sha)
@@ -824,6 +832,7 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
         with ls.trace(
             name=trace_name,
             run_type="chain",
+            project_name=pr_project_name,
             inputs={
                 "file_path": fp,
                 "hunk_start": h.target_start,
@@ -923,6 +932,7 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
                     with ls.trace(
                         name=hunk_trace_name(i),
                         run_type="chain",
+                        project_name=pr_project_name,
                         inputs={
                             "file_path": fp,
                             "hunk_start": h.target_start,
