@@ -25,10 +25,27 @@ REVIEW_MAX_CONCURRENCY = int(os.getenv("REVIEW_MAX_CONCURRENCY", "1"))
 # Review bot settings
 DIFF_CONTEXT = int(os.getenv("DIFF_CONTEXT", "10"))
 REVIEW_PARALLEL_WORKERS = int(os.getenv("REVIEW_PARALLEL_WORKERS", "4"))
-REVIEW_PARALLEL_PASSES = os.getenv("REVIEW_PARALLEL_PASSES", "false").lower() in ("1", "true", "yes")
 REVIEW_INCLUDE_PATHS: List[str] = [
     p.strip() for p in os.getenv("REVIEW_INCLUDE_PATHS", "src/").split(",") if p.strip()
 ]
+
+# Parallelism mode. One of:
+#   "sequential" — per-file phase batching: for each file, run each pass over all
+#                  hunks before moving to the next pass. Workers ignored.
+#   "hunk"       — ThreadPool(workers) over all hunks (cross-file). Within each
+#                  hunk the 4 passes run sequentially. (Previous default behavior
+#                  when REVIEW_PARALLEL_PASSES=true.)
+#   "pass"       — ThreadPool(workers) over hunks; within each hunk the 4 passes
+#                  run concurrently in an inner pool of size 4.
+# Resolved at module import time but the TUI in main.py may set the env var
+# before this module is imported.
+_PARALLELISM_CHOICES = ("sequential", "hunk", "pass")
+REVIEW_PARALLELISM = os.getenv("REVIEW_PARALLELISM", "hunk").strip().lower()
+if REVIEW_PARALLELISM not in _PARALLELISM_CHOICES:
+    raise ValueError(
+        f"REVIEW_PARALLELISM='{REVIEW_PARALLELISM}' invalid. "
+        f"Expected one of {_PARALLELISM_CHOICES}."
+    )
 
 
 # LLM provider selection

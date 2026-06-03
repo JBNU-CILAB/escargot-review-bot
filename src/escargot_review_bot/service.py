@@ -27,8 +27,8 @@ from escargot_review_bot.config.config import (
     OLLAMA_KEEP_ALIVE,
     PASS_TYPES,
     REVIEW_INCLUDE_PATHS,
-    REVIEW_PARALLEL_PASSES,
     REVIEW_PARALLEL_WORKERS,
+    REVIEW_PARALLELISM,
     any_pass_uses_provider,
     resolve_pass_model,
     resolve_pass_provider,
@@ -644,8 +644,16 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
     import os
     
     logger.info(f"Start review PR=#{request.pull_request_number} {request.base_sha}..{request.head_sha}")
-    
-    pr_project_name = f"escargot-review-bot/PR-{request.pull_request_number}"
+
+    # Project name carries (PR, parallelism mode, provider) so ablation runs
+    # land in clearly-separated LangSmith projects. Provider collapses to a
+    # single slug when all 5 passes share the same provider; otherwise "mixed".
+    providers = {resolve_pass_provider(p) for p in PASS_TYPES}
+    provider_slug = next(iter(providers)) if len(providers) == 1 else "mixed"
+    pr_project_name = (
+        f"escargot-review-bot/PR-{request.pull_request_number}"
+        f"-{REVIEW_PARALLELISM}-{provider_slug}"
+    )
     
     # 환경변수를 동적으로 변경하여 LangChain 자동 트레이싱도 PR별 프로젝트로 보냄
     old_project = os.environ.get("LANGCHAIN_PROJECT")
@@ -719,26 +727,48 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
         logger.info("No hunks to review.")
         return []
 
+    # Resolve effective mode. `sequential` is fully serial (workers ignored).
+    # `hunk` and `pass` both use REVIEW_PARALLEL_WORKERS to size the hunk pool.
+    # The OLLAMA_KEEP_ALIVE=0 guard forces single-threaded execution for any
+    # mode that would otherwise issue concurrent ollama calls (model unload race).
+    mode = REVIEW_PARALLELISM
     workers = max(1, REVIEW_PARALLEL_WORKERS)
-    if OLLAMA_KEEP_ALIVE == "0" and workers > 1 and any_pass_uses_provider("ollama"):
-        logger.info(
-            f"OLLAMA_KEEP_ALIVE=0 with an ollama pass: forcing workers=1 to avoid model unload race (was {workers})."
-        )
-        workers = 1
+    if (
+        mode in ("hunk", "pass")
+        and OLLAMA_KEEP_ALIVE == "0"
+        and any_pass_uses_provider("ollama")
+    ):
+        if mode == "pass":
+            logger.info(
+                "OLLAMA_KEEP_ALIVE=0 with an ollama pass: "
+                "downgrading parallelism=pass → sequential to avoid model unload race."
+            )
+            mode = "sequential"
+        elif workers > 1:
+            logger.info(
+                f"OLLAMA_KEEP_ALIVE=0 with an ollama pass: forcing workers=1 to avoid model unload race (was {workers})."
+            )
+            workers = 1
 
     provider_breakdown: Dict[str, str] = {
         p: f"{resolve_pass_provider(p)}:{resolve_pass_model(p)}" for p in PASS_TYPES
     }
-    use_parallel_passes = REVIEW_PARALLEL_PASSES
     models_info = ", ".join(f"{p}={provider_breakdown[p]}" for p in PASS_TYPES)
-    if use_parallel_passes:
+    if mode == "sequential":
         logger.info(
-            f"Parallel passes enabled: [{models_info}], "
-            f"{len(hunk_items)} hunks × 4 passes = {4 * len(hunk_items)} tasks, "
-            f"max_workers={min(4 * workers, 4 * len(hunk_items))}."
+            f"Sequential (per-file phase batching): [{models_info}], "
+            f"{len(hunk_items)} hunks across {len({fp for fp, *_ in hunk_items})} files."
         )
-    else:
-        logger.info(f"Sequential review: [{models_info}], {len(hunk_items)} hunks, {workers} workers per pass.")
+    elif mode == "hunk":
+        logger.info(
+            f"Hunk-level parallel: [{models_info}], "
+            f"{len(hunk_items)} hunks, workers={workers}, passes-per-hunk sequential."
+        )
+    else:  # pass
+        logger.info(
+            f"Pass-level parallel: [{models_info}], "
+            f"{len(hunk_items)} hunks, outer workers={workers} × inner passes=4 = up to {workers * 4} concurrent calls."
+        )
 
     if EXPERIMENT_LOGGING_ENABLED:
         import os as _os
@@ -763,13 +793,34 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
             return f"L{start}"
         return f"L{start}-L{end}"
 
-    def run_single_hunk(i: int) -> List[Dict[str, Any]]:
-        """Run all passes for a single hunk within a unified trace."""
+    def hunk_trace_name(i: int) -> str:
+        fp, h, _, _ = hunk_items[i]
+        return f"{fp.split('/')[-1]}_{get_hunk_line_range(h)}"
+
+    def run_pass(i: int, pass_type: str) -> List[Dict[str, Any]]:
         fp, h, m, md = hunk_items[i]
-        file_name = fp.split('/')[-1]
-        line_range = get_hunk_line_range(h)
-        trace_name = f"{file_name}_{line_range}"
-        
+        return _run_review_pass(
+            model_type=pass_type,
+            file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+            head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+            metrics=metrics, hunk_id=hunk_trace_name(i),
+        )
+
+    def merge_hunk(i: int, pass_results: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        return _merge_comments_by_line(
+            hunk_items[i],
+            pass_results.get("defect", []),
+            pass_results.get("refactor", []),
+            pass_results.get("compiler", []),
+            pass_results.get("style", []),
+            metrics=metrics,
+            hunk_id=hunk_trace_name(i),
+        )
+
+    def run_single_hunk(i: int, parallel_passes: bool = False) -> List[Dict[str, Any]]:
+        """Run all 4 passes for a single hunk within a unified trace, then merge."""
+        fp, h, _, _ = hunk_items[i]
+        trace_name = hunk_trace_name(i)
         with ls.trace(
             name=trace_name,
             run_type="chain",
@@ -783,80 +834,149 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
                 "hunk_index": i,
                 "target_start": h.target_start,
                 "target_length": h.target_length,
+                "parallel_passes": parallel_passes,
             },
         ) as hunk_run:
-            defect_comments = _run_review_pass(
-                model_type="defect",
-                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
-                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
-                metrics=metrics, hunk_id=trace_name,
-            )
+            if parallel_passes:
+                pass_results: Dict[str, List[Dict[str, Any]]] = {}
 
-            refactor_comments = _run_review_pass(
-                model_type="refactor",
-                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
-                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
-                metrics=metrics, hunk_id=trace_name,
-            )
+                # contextvars do NOT propagate into ThreadPoolExecutor workers,
+                # so each pass thread would lose the active hunk trace and its
+                # LLM spans would surface as orphaned top-level runs. Re-bind the
+                # parent RunTree inside the worker so all 4 passes nest under this
+                # hunk's trace (project is inherited via the parent).
+                def run_pass_traced(pass_type: str) -> List[Dict[str, Any]]:
+                    with ls.tracing_context(parent=hunk_run):
+                        return run_pass(i, pass_type)
 
-            compiler_comments = _run_review_pass(
-                model_type="compiler",
-                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
-                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
-                metrics=metrics, hunk_id=trace_name,
-            )
+                with ThreadPoolExecutor(max_workers=4, thread_name_prefix=f"pass-{i}") as inner:
+                    futures = {pt: inner.submit(run_pass_traced, pt) for pt in ("defect", "refactor", "compiler", "style")}
+                    for pt, fut in futures.items():
+                        try:
+                            pass_results[pt] = fut.result()
+                        except Exception as e:
+                            logger.exception(f"{pt} pass failed for hunk {i}: {e}")
+                            pass_results[pt] = []
+            else:
+                pass_results = {pt: run_pass(i, pt) for pt in ("defect", "refactor", "compiler", "style")}
 
-            style_comments = _run_review_pass(
-                model_type="style",
-                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
-                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
-                metrics=metrics, hunk_id=trace_name,
-            )
-
-            merged = _merge_comments_by_line(
-                hunk_items[i],
-                defect_comments,
-                refactor_comments,
-                compiler_comments,
-                style_comments,
-                metrics=metrics,
-                hunk_id=trace_name,
-            )
-            
+            merged = merge_hunk(i, pass_results)
             hunk_run.end(outputs={
                 "comment_count": len(merged),
-                "defect_count": len(defect_comments),
-                "refactor_count": len(refactor_comments),
-                "compiler_count": len(compiler_comments),
-                "style_count": len(style_comments),
+                "defect_count": len(pass_results.get("defect", [])),
+                "refactor_count": len(pass_results.get("refactor", [])),
+                "compiler_count": len(pass_results.get("compiler", [])),
+                "style_count": len(pass_results.get("style", [])),
             })
-            
             return merged
 
     all_github_comments: List[Dict[str, Any]] = []
 
     try:
         hunk_indices = list(range(len(hunk_items)))
-        if use_parallel_passes:
+
+        if mode == "sequential":
+            # Per-file phase batching: for each file, run each pass over all hunks,
+            # then per-hunk judge merge.
+            #
+            # Tracing policy (experiment-focused): the 4 passes and the judge are
+            # run with LangSmith tracing *disabled*, so none of the intermediate
+            # LLM round-trips flood the project as flat top-level runs. Instead we
+            # emit exactly one trace per changed hunk that produced a comment,
+            # carrying only the judge-merged comment(s) as its output. JSONL
+            # metrics are unaffected — usage/latency come from AIMessage, not
+            # LangSmith.
+            file_groups: Dict[str, List[int]] = {}
+            for idx in hunk_indices:
+                fp = hunk_items[idx][0]
+                file_groups.setdefault(fp, []).append(idx)
+
+            for file_path, idxs in file_groups.items():
+                logger.info(f"[seq] file={file_path} hunks={len(idxs)}")
+                pass_results_per_hunk: Dict[int, Dict[str, List[Dict[str, Any]]]] = {i: {} for i in idxs}
+                merged_per_hunk: Dict[int, List[Dict[str, Any]]] = {}
+
+                # Passes + judge merge: suppress per-call auto-tracing entirely.
+                with ls.tracing_context(enabled=False):
+                    for pass_type in ("defect", "refactor", "compiler", "style"):
+                        for i in idxs:
+                            try:
+                                pass_results_per_hunk[i][pass_type] = run_pass(i, pass_type)
+                            except Exception as e:
+                                logger.exception(f"{pass_type} pass failed for hunk {i}: {e}")
+                                pass_results_per_hunk[i][pass_type] = []
+                    for i in idxs:
+                        try:
+                            merged_per_hunk[i] = merge_hunk(i, pass_results_per_hunk[i])
+                        except Exception as e:
+                            logger.exception(f"Hunk {i} merge failed: {e}")
+                            merged_per_hunk[i] = []
+
+                # Emit one clean trace per changed hunk that yielded merged
+                # comment(s). Nothing is invoked inside the trace, so it stays a
+                # single leaf run whose output is just the merged comment(s).
+                for i in idxs:
+                    merged = merged_per_hunk.get(i) or []
+                    if not merged:
+                        continue
+                    fp, h, _, _ = hunk_items[i]
+                    with ls.trace(
+                        name=hunk_trace_name(i),
+                        run_type="chain",
+                        inputs={
+                            "file_path": fp,
+                            "hunk_start": h.target_start,
+                            "hunk_length": h.target_length,
+                        },
+                        metadata={
+                            "file_path": fp,
+                            "hunk_index": i,
+                            "target_start": h.target_start,
+                            "target_length": h.target_length,
+                            "mode": "sequential",
+                        },
+                    ) as hunk_run:
+                        hunk_run.end(outputs={
+                            "comments": merged,
+                            "comment_count": len(merged),
+                        })
+                    all_github_comments.extend(merged)
+
+        elif mode == "hunk":
             chunks = [hunk_indices[i:i + workers] for i in range(0, len(hunk_indices), workers)]
             for chunk_idx, chunk in enumerate(chunks):
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    future_to_idx = {executor.submit(run_single_hunk, i): i for i in chunk}
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="hunk") as executor:
+                    future_to_idx = {executor.submit(run_single_hunk, i, False): i for i in chunk}
                     for future in as_completed(future_to_idx):
                         hunk_idx = future_to_idx[future]
                         try:
                             all_github_comments.extend(future.result())
                         except Exception as e:
                             logger.exception(f"Hunk {hunk_idx} review failed: {e}")
-                if chunk_idx < len(chunks) - 1:
+                # The 90s inter-batch sleep is an OpenAI TPM rate-limit
+                # countermeasure. Local Ollama has no TPM cap, so skip it when
+                # any pass uses ollama — otherwise it's pure wasted wall-clock.
+                if chunk_idx < len(chunks) - 1 and not any_pass_uses_provider("ollama"):
                     logger.info(f"Batch {chunk_idx + 1}/{len(chunks)} done. Sleeping 90s (TPM rate limit)...")
                     time.sleep(90)
-        else:
-            for i in hunk_indices:
-                try:
-                    all_github_comments.extend(run_single_hunk(i))
-                except Exception as e:
-                    logger.exception(f"Hunk {i} review failed: {e}")
+
+        else:  # pass
+            chunks = [hunk_indices[i:i + workers] for i in range(0, len(hunk_indices), workers)]
+            for chunk_idx, chunk in enumerate(chunks):
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="hunk") as executor:
+                    future_to_idx = {executor.submit(run_single_hunk, i, True): i for i in chunk}
+                    for future in as_completed(future_to_idx):
+                        hunk_idx = future_to_idx[future]
+                        try:
+                            all_github_comments.extend(future.result())
+                        except Exception as e:
+                            logger.exception(f"Hunk {hunk_idx} review failed: {e}")
+                # The 90s inter-batch sleep is an OpenAI TPM rate-limit
+                # countermeasure. Local Ollama has no TPM cap, so skip it when
+                # any pass uses ollama — otherwise it's pure wasted wall-clock.
+                if chunk_idx < len(chunks) - 1 and not any_pass_uses_provider("ollama"):
+                    logger.info(f"Batch {chunk_idx + 1}/{len(chunks)} done. Sleeping 90s (TPM rate limit)...")
+                    time.sleep(90)
     finally:
         try:
             metrics.finalize(
@@ -867,6 +987,9 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.warning(f"Metrics finalize failed: {e}")
 
-    logger.info(f"Generated {len(all_github_comments)} comments (hunks={len(hunk_items)}, parallel={use_parallel_passes}).")
+    logger.info(
+        f"Generated {len(all_github_comments)} comments "
+        f"(hunks={len(hunk_items)}, parallelism={mode}, workers={workers})."
+    )
     return all_github_comments
 
