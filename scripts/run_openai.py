@@ -47,6 +47,12 @@ TPM 대비책으로 동작한다.)
     #   → single 은 threading 모드가 결과/비용에 영향 없으므로 모드 1개만 돈다.
     #   → 라벨 openai-{model}-single 로 파일명이 구분됨.
 
+    # 결과 저장 위치 지정 (기본: experiments/)
+    python scripts/run_openai.py --out-dir experiments/0604
+
+    # LangSmith 프로젝트명에 회차 번호 붙이기 (예: escargot-review-bot/01-PR-4-...)
+    python scripts/run_openai.py --run-number 01
+
 결과 파일 (experiments/ 디렉토리)
 ---------------------------------
     PR-{n}-{model}-{ts}-comments.json  : GitHub에 올라갈 코멘트 원본 (모델명의 ':' '/' 은 '-' 로 치환)
@@ -74,7 +80,7 @@ EXPERIMENTS = [
 # 모드별 기본 worker 수. sequential 은 service 가 worker 를 무시하므로 항상 1.
 # hunk/pass 의 값은 --workers 로 덮어쓸 수 있다. OpenAI 는 TPM rate limit 때문에
 # 보수적으로 1 을 기본값으로 둔다.
-DEFAULT_HUNK_PASS_WORKERS = 3
+DEFAULT_HUNK_PASS_WORKERS = 1
 
 import argparse
 import json

@@ -46,6 +46,12 @@ hunk/pass 의 worker 동시성을 그대로 살린다. `--keep-alive 0` 으로 �
     # hunk/pass worker 수 변경 (sequential 은 항상 1)
     python scripts/run_ollama.py --workers 4
 
+    # GPU 샘플링 끄기 (nvidia-smi 없는 환경, 또는 오버헤드 제거 시)
+    python scripts/run_ollama.py --gpu-interval 0
+
+    # LangSmith 프로젝트명에 회차 번호 붙이기 (예: escargot-review-bot/01-PR-4-...)
+    python scripts/run_ollama.py --run-number 01
+
 결과 파일 (experiments/ 디렉토리)
 ---------------------------------
     PR-{n}-{model}-{ts}-comments.json  : GitHub에 올라갈 코멘트 원본 (모델명의 ':' 은 '-' 로 치환)
