@@ -49,7 +49,15 @@ hunk/pass 의 worker 동시성을 그대로 살린다. `--keep-alive 0` 으로 �
 결과 파일 (experiments/ 디렉토리)
 ---------------------------------
     PR-{n}-{model}-{ts}-comments.json  : GitHub에 올라갈 코멘트 원본 (모델명의 ':' 은 '-' 로 치환)
-    PR-{n}-ollama-{model}-{ts}.jsonl   : metrics (토큰수, latency 등)
+    PR-{n}-ollama-{model}-{ts}.jsonl   : metrics (토큰수, latency 등 — service.py MetricsLogger)
+    PR-{n}-{model}-{ts}-gpu.json       : 리뷰 구간 GPU 사용률 요약(mean/max/p95) — nvidia-smi 샘플링
+                                         (--gpu-interval 0 또는 nvidia-smi 부재 시 생성 안 함)
+
+GPU 지표 주의 (vGPU)
+--------------------
+이 머신은 vGPU 프로파일(RTXA6000-48C)이라 nvidia-smi 가 power.draw/temperature 를
+[N/A] 로 막는다 → 전력·에너지·온도는 수집 불가. 수집되는 것: SM 사용률(%),
+메모리 대역폭 사용률(%), VRAM 사용량(MiB), SM 클럭(MHz).
 
 전제 조건 / 주의
 ----------------
@@ -79,9 +87,11 @@ DEFAULT_HUNK_PASS_WORKERS = 3
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -95,12 +105,120 @@ def _safe(model: str) -> str:
     return model.replace(":", "-").replace("/", "-")
 
 
+# ============================================================
+# GPU 샘플링 (nvidia-smi 서브프로세스, 의존성 없음)
+# ============================================================
+# 이 머신의 GPU 는 vGPU 프로파일(RTXA6000-48C)이라 power.draw / power.limit /
+# temperature.gpu 가 모두 [N/A] 로 막혀 있다. 따라서 전력·에너지·온도 지표는
+# 수집할 수 없고, 아래 필드만 유효하다:
+#   utilization.gpu  SM(연산) 사용률 %        ← "GPU 점유율"의 핵심
+#   utilization.memory  메모리 대역폭 사용률 %
+#   memory.used      VRAM 사용량 MiB          (이 VM 안에선 ollama 가 유일 소비자)
+#   clocks.sm        SM 클럭 MHz
+_NVIDIA_SMI = shutil.which("nvidia-smi")
+_GPU_QUERY = "utilization.gpu,utilization.memory,memory.used,memory.total,clocks.sm"
+
+
+def _gpu_sample():
+    """nvidia-smi 한 줄을 파싱해 한 샘플(dict)을 반환. 실패/미지원 시 None.
+    숫자가 아닌 필드([N/A] 등)는 None 으로 둬서 집계에서 자연히 제외된다."""
+    if not _NVIDIA_SMI:
+        return None
+    try:
+        out = subprocess.run(
+            [_NVIDIA_SMI, f"--query-gpu={_GPU_QUERY}",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip().splitlines()
+    except Exception:
+        return None
+    if not out:
+        return None
+
+    def num(x):
+        try:
+            return float(x.strip())
+        except (ValueError, AttributeError):
+            return None
+
+    parts = out[0].split(",")  # 단일 GPU 박스 → 첫 행
+    if len(parts) < 5:
+        return None
+    return {
+        "util_gpu": num(parts[0]),
+        "util_mem": num(parts[1]),
+        "mem_used": num(parts[2]),
+        "mem_total": num(parts[3]),
+        "clock_sm": num(parts[4]),
+    }
+
+
+class GpuSampler:
+    """리뷰 1건이 도는 동안 백그라운드 스레드로 nvidia-smi 를 주기적으로 폴링.
+
+    SM 사용률 / 메모리 대역폭 사용률 / VRAM 사용량을 누적해 mean·max·p95 로 요약한다.
+    interval<=0 또는 nvidia-smi 부재 시 비활성(샘플 0개). context manager 로 사용:
+        with GpuSampler(0.25) as s: ...; stats = s.summary()
+    """
+
+    def __init__(self, interval: float = 0.25):
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self._samples = []
+
+    def __enter__(self):
+        if _NVIDIA_SMI and self.interval > 0:
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+        return self
+
+    def _loop(self):
+        while not self._stop.is_set():
+            s = _gpu_sample()
+            if s:
+                self._samples.append(s)
+            self._stop.wait(self.interval)
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        return False
+
+    def summary(self) -> dict:
+        n = len(self._samples)
+        if not n:
+            return {"samples": 0, "available": bool(_NVIDIA_SMI and self.interval > 0)}
+
+        def agg(key):
+            vals = [s[key] for s in self._samples if s.get(key) is not None]
+            if not vals:
+                return None
+            sv = sorted(vals)
+            idx = int(round(0.95 * (len(sv) - 1)))
+            return {"mean": round(sum(vals) / len(vals), 1),
+                    "max": round(max(vals), 1),
+                    "p95": round(sv[idx], 1)}
+
+        return {
+            "samples": n,
+            "interval_s": self.interval,
+            "util_gpu_pct": agg("util_gpu"),
+            "util_mem_pct": agg("util_mem"),
+            "mem_used_mib": agg("mem_used"),
+            "mem_total_mib": self._samples[-1].get("mem_total"),
+            "clock_sm_mhz": agg("clock_sm"),
+        }
+
+
 def _workers_for(mode: str, hunk_pass_workers: int) -> int:
     """모드별 worker 수. sequential 은 항상 1, hunk/pass 는 인자값."""
     return 1 if mode == "sequential" else max(1, hunk_pass_workers)
 
 
-def run_one(pr: int, base: str, head: str, model: str) -> dict:
+def run_one(pr: int, base: str, head: str, model: str,
+            gpu_interval: float = 0.25) -> dict:
     from escargot_review_bot.config.config import EXPERIMENT_LOG_DIR
     from escargot_review_bot.domain.schemas import ReviewRequest
     from escargot_review_bot.service import generate_review_comments
@@ -108,8 +226,10 @@ def run_one(pr: int, base: str, head: str, model: str) -> dict:
     request = ReviewRequest(base_sha=base, head_sha=head, pull_request_number=pr)
 
     started = time.time()
-    comments = generate_review_comments(request)
+    with GpuSampler(interval=gpu_interval) as sampler:
+        comments = generate_review_comments(request)
     elapsed = round(time.time() - started, 1)
+    gpu = sampler.summary()
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = Path(EXPERIMENT_LOG_DIR)
@@ -118,11 +238,35 @@ def run_one(pr: int, base: str, head: str, model: str) -> dict:
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(comments, f, ensure_ascii=False, indent=2)
 
-    return {"comments": comments, "elapsed": elapsed, "out_path": out_path}
+    # GPU 요약은 별도 사이드카로(코멘트 JSON 오염 방지). 샘플이 있을 때만 기록.
+    if gpu.get("samples"):
+        gpu_path = out_dir / f"PR-{pr}-{_safe(model)}-{ts}-gpu.json"
+        gpu_path.write_text(
+            json.dumps({"pr": pr, "model": model, "elapsed_s": elapsed, **gpu},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8")
+
+    return {"comments": comments, "elapsed": elapsed, "out_path": out_path, "gpu": gpu}
+
+
+def _gpu_oneline(gpu: dict) -> str:
+    """run_one 의 gpu 요약을 한 줄 텍스트로. 샘플 없으면 빈 문자열."""
+    if not gpu or not gpu.get("samples"):
+        return ""
+    u = gpu.get("util_gpu_pct") or {}
+    m = gpu.get("mem_used_mib") or {}
+    parts = []
+    if u:
+        parts.append(f"GPU {u['mean']}%/{u['max']}% (mean/max)")
+    if m:
+        parts.append(f"VRAM {m['max']:.0f}MiB peak")
+    return "  |  ".join(parts)
 
 
 def _run_single_mode(mode: str, model: str, workers: int, keep_alive: str,
-                     results_out: str | None = None) -> int:
+                     results_out: str | None = None,
+                     gpu_interval: float = 0.25,
+                     run_number: str = "") -> int:
     """단일 모드를 현재 프로세스에서 실행. env 는 config import 전에 세팅해야 하므로
     여기서 service/config 를 처음 import 한다(run_one 안의 import 가 트리거).
 
@@ -133,6 +277,10 @@ def _run_single_mode(mode: str, model: str, workers: int, keep_alive: str,
                 "MODEL_COMPILER", "MODEL_STYLE", "MODEL_JUDGE"):
         os.environ[key] = "ollama" if key == "LLM_PROVIDER" else model
     os.environ["EXPERIMENT_LABEL"] = f"ollama-{_safe(model)}"
+    if run_number:
+        os.environ["LANGSMITH_RUN_PREFIX"] = run_number
+    else:
+        os.environ.pop("LANGSMITH_RUN_PREFIX", None)
     os.environ["REVIEW_PARALLELISM"] = mode
     os.environ["REVIEW_PARALLEL_WORKERS"] = str(workers)
     os.environ["OLLAMA_KEEP_ALIVE"] = keep_alive
@@ -150,12 +298,17 @@ def _run_single_mode(mode: str, model: str, workers: int, keep_alive: str,
         sys.stdout.flush()
 
         try:
-            r = run_one(pr=pr, base=base, head=head, model=model)
+            r = run_one(pr=pr, base=base, head=head, model=model,
+                        gpu_interval=gpu_interval)
             comments = r["comments"]
             elapsed = r["elapsed"]
             out_path = r["out_path"]
+            gpu = r.get("gpu") or {}
 
             print(f"  → {len(comments)}개 코멘트  |  {elapsed}s  |  {out_path.name}")
+            gpu_line = _gpu_oneline(gpu)
+            if gpu_line:
+                print(f"     {gpu_line}")
             for j, c in enumerate(comments, 1):
                 path = c.get("path", "?") if isinstance(c, dict) else c.path
                 line = c.get("line", "?") if isinstance(c, dict) else c.line
@@ -163,7 +316,10 @@ def _run_single_mode(mode: str, model: str, workers: int, keep_alive: str,
                 print(f"     [{j}] {path}:{line}  {body[:120]}{'...' if len(body) > 120 else ''}")
 
             results.append({"mode": mode, "pr": pr, "status": "ok",
-                            "comments": len(comments), "elapsed": elapsed})
+                            "comments": len(comments), "elapsed": elapsed,
+                            "gpu_util_mean": (gpu.get("util_gpu_pct") or {}).get("mean"),
+                            "gpu_util_max": (gpu.get("util_gpu_pct") or {}).get("max"),
+                            "vram_peak_mib": (gpu.get("mem_used_mib") or {}).get("max")})
 
         except KeyboardInterrupt:
             print("\n[run_ollama] 중단됨 (KeyboardInterrupt)")
@@ -178,7 +334,10 @@ def _run_single_mode(mode: str, model: str, workers: int, keep_alive: str,
     print(f"[run_ollama] MODE={mode} 완료  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     for r in results:
         if r["status"] == "ok":
-            print(f"  [{r['mode']:>10}] PR #{r['pr']:>4}  ok  {r['comments']}개 코멘트  {r['elapsed']}s")
+            g = ""
+            if r.get("gpu_util_mean") is not None:
+                g = f"  GPU {r['gpu_util_mean']}%/{r['gpu_util_max']}%"
+            print(f"  [{r['mode']:>10}] PR #{r['pr']:>4}  ok  {r['comments']}개 코멘트  {r['elapsed']}s{g}")
         else:
             print(f"  [{r['mode']:>10}] PR #{r['pr']:>4}  FAILED  {r.get('error', '')}")
     print("=" * 60)
@@ -193,7 +352,8 @@ def _run_single_mode(mode: str, model: str, workers: int, keep_alive: str,
     return 0 if all(r["status"] == "ok" for r in results) else 1
 
 
-def _orchestrate(modes: list, model: str, hunk_pass_workers: int, keep_alive: str) -> int:
+def _orchestrate(modes: list, model: str, hunk_pass_workers: int, keep_alive: str,
+                 gpu_interval: float = 0.25, run_number: str = "") -> int:
     """여러 모드 요청 시: 모드마다 자기 자신을 단일 모드 서브프로세스로 재실행.
     config 모듈 상수(REVIEW_PARALLELISM/WORKERS/KEEP_ALIVE)는 import 시 고정되므로
     한 프로세스에서 모드를 바꿀 수 없어 모드별 새 프로세스가 필요하다."""
@@ -210,7 +370,10 @@ def _orchestrate(modes: list, model: str, hunk_pass_workers: int, keep_alive: st
         cmd = [sys.executable, str(Path(__file__).resolve()),
                "--model", model, "--modes", mode,
                "--workers", str(hunk_pass_workers), "--keep-alive", keep_alive,
+               "--gpu-interval", str(gpu_interval),
                "--results-out", str(results_path)]
+        if run_number:
+            cmd += ["--run-number", run_number]
         print(f"\n[run_ollama] ▶ subprocess: {' '.join(cmd)}", flush=True)
         started = time.time()
         try:
@@ -246,11 +409,25 @@ def _orchestrate(modes: list, model: str, hunk_pass_workers: int, keep_alive: st
         print(f"\n[{m['mode']:>10}]  {status}  (wall {m['wall']}s)")
         for r in m["results"]:
             if r["status"] == "ok":
-                print(f"     PR #{r['pr']:>4}  {r['elapsed']:>7}s  ({r['comments']}개 코멘트)")
+                g = ""
+                if r.get("gpu_util_mean") is not None:
+                    g = f"  |  GPU {r['gpu_util_mean']}%/{r['gpu_util_max']}%"
+                print(f"     PR #{r['pr']:>4}  {r['elapsed']:>7}s  ({r['comments']}개 코멘트){g}")
             else:
                 print(f"     PR #{r['pr']:>4}  FAILED  {r.get('error', '')}")
         print(f"     {'─' * 40}")
-        print(f"     소계: 리뷰합 {pr_sum}s  |  wall {m['wall']}s")
+        # 모드 GPU 소계: PR별 mean 의 평균, max 중 최대, VRAM peak 중 최대
+        umeans = [r["gpu_util_mean"] for r in m["results"]
+                  if r.get("gpu_util_mean") is not None]
+        umaxes = [r["gpu_util_max"] for r in m["results"]
+                  if r.get("gpu_util_max") is not None]
+        vpeaks = [r["vram_peak_mib"] for r in m["results"]
+                  if r.get("vram_peak_mib") is not None]
+        gpu_sub = ""
+        if umeans:
+            gpu_sub = (f"  |  GPU 평균 {round(sum(umeans)/len(umeans), 1)}% "
+                       f"(peak {max(umaxes)}%)  VRAM {max(vpeaks):.0f}MiB")
+        print(f"     소계: 리뷰합 {pr_sum}s  |  wall {m['wall']}s{gpu_sub}")
     print("-" * 60)
     print(f"전체 소요 시간: {overall}s")
     print("=" * 60)
@@ -284,6 +461,16 @@ def main() -> int:
              "pass→sequential 로 클램프하므로 worker 동시성을 쓰려면 0 이외 값으로 둘 것.",
     )
     parser.add_argument(
+        "--gpu-interval", type=float, default=0.25,
+        help="GPU 샘플링 주기(초, default: 0.25). 0 이면 GPU 샘플링 끔. "
+             "nvidia-smi 가 없으면 자동 비활성. vGPU(RTXA6000-48C)라 전력/온도는 [N/A].",
+    )
+    parser.add_argument(
+        "--run-number", default="",
+        help="LangSmith 프로젝트명 앞에 붙을 식별 번호/문자열 (예: 01, exp02). "
+             "미지정 시 prefix 없음.",
+    )
+    parser.add_argument(
         "--results-out", default=None,
         help=argparse.SUPPRESS,  # 내부용: 오케스트레이터가 단일 모드 자식에 PR별 결과 기록을 요청
     )
@@ -292,11 +479,13 @@ def main() -> int:
     # 여러 모드 → 모드별 서브프로세스 오케스트레이션.
     # 단일 모드 → 현재 프로세스에서 직접 실행(config 가 이 모드/worker 로 고정됨).
     if len(args.modes) > 1:
-        return _orchestrate(args.modes, args.model, max(1, args.workers), args.keep_alive)
+        return _orchestrate(args.modes, args.model, max(1, args.workers),
+                            args.keep_alive, args.gpu_interval, args.run_number)
 
     mode = args.modes[0]
     workers = _workers_for(mode, args.workers)
-    return _run_single_mode(mode, args.model, workers, args.keep_alive, args.results_out)
+    return _run_single_mode(mode, args.model, workers, args.keep_alive,
+                            args.results_out, args.gpu_interval, args.run_number)
 
 
 if __name__ == "__main__":

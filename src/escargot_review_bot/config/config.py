@@ -48,10 +48,35 @@ if REVIEW_PARALLELISM not in _PARALLELISM_CHOICES:
     )
 
 
+# Review pipeline shape. One of:
+#   "multipass" — default: 4 specialist passes (defect/refactor/compiler/style)
+#                 per hunk, then a judge merge per (path, line).
+#   "single"    — one combined reviewer ("single" pass) per hunk that does all
+#                 four jobs at once; no judge merge. Used to compare a single
+#                 high-capability LLM against the multi-pass ensemble.
+# Resolved at import time; ablation scripts set the env var before import.
+_PIPELINE_CHOICES = ("multipass", "single")
+REVIEW_PIPELINE = os.getenv("REVIEW_PIPELINE", "multipass").strip().lower()
+if REVIEW_PIPELINE not in _PIPELINE_CHOICES:
+    raise ValueError(
+        f"REVIEW_PIPELINE='{REVIEW_PIPELINE}' invalid. "
+        f"Expected one of {_PIPELINE_CHOICES}."
+    )
+
+
 # LLM provider selection
 # Re-read per call so changes between requests (e.g. ablation scripts) take effect
 # without restarting the server.
 PASS_TYPES = ("defect", "refactor", "compiler", "style", "judge")
+
+# Single-pass uses exactly one pass type. Metrics/project-naming should reflect
+# the passes that actually run, so callers use this instead of PASS_TYPES.
+SINGLE_PASS_TYPES = ("single",)
+
+
+def active_pass_types() -> tuple:
+    """Pass types that actually execute under the current REVIEW_PIPELINE."""
+    return SINGLE_PASS_TYPES if REVIEW_PIPELINE == "single" else PASS_TYPES
 
 
 def resolve_pass_provider(pass_type: str) -> str:
@@ -69,8 +94,8 @@ def resolve_pass_model(pass_type: str) -> str:
 
 
 def any_pass_uses_provider(provider: str) -> bool:
-    """True if any of the 5 passes is configured to use the given provider."""
-    return any(resolve_pass_provider(p) == provider for p in PASS_TYPES)
+    """True if any actively-running pass is configured to use the given provider."""
+    return any(resolve_pass_provider(p) == provider for p in active_pass_types())
 
 
 # Ollama configuration

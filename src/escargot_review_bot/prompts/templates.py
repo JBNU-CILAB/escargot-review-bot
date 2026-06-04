@@ -12,6 +12,7 @@ from escargot_review_bot.prompts.refactor import SYSTEM_PROMPT_REFACTOR
 from escargot_review_bot.prompts.compiler import SYSTEM_PROMPT_COMPILER
 from escargot_review_bot.prompts.style import SYSTEM_PROMPT_STYLE
 from escargot_review_bot.prompts.judge import SYSTEM_PROMPT_JUDGE
+from escargot_review_bot.prompts.single import SYSTEM_PROMPT_SINGLE
 
 
 REVIEW_USER_TEMPLATE = """\
@@ -75,6 +76,13 @@ judge_prompt = ChatPromptTemplate.from_messages([
     HumanMessagePromptTemplate.from_template(JUDGE_USER_TEMPLATE),
 ])
 
+# Single-pass: one combined reviewer (defect+refactor+compiler+style) per hunk,
+# no judge merge. Reuses REVIEW_USER_TEMPLATE and the review comment schema.
+single_prompt = ChatPromptTemplate.from_messages([
+    SystemMessage(content=SYSTEM_PROMPT_SINGLE),
+    HumanMessagePromptTemplate.from_template(REVIEW_USER_TEMPLATE),
+])
+
 
 PROMPT_REGISTRY = {
     "defect": defect_prompt,
@@ -82,6 +90,7 @@ PROMPT_REGISTRY = {
     "compiler": compiler_prompt,
     "style": style_prompt,
     "judge": judge_prompt,
+    "single": single_prompt,
 }
 
 

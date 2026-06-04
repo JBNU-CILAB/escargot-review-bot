@@ -60,6 +60,7 @@ class NullMetricsLogger:
     def log_llm_call(self, **_: Any) -> None: ...
     def log_pass_summary(self, **_: Any) -> None: ...
     def log_judge_call(self, **_: Any) -> None: ...
+    def record_sleep(self, seconds: float) -> None: ...
     def finalize(self, **_: Any) -> None: ...
 
 
@@ -86,6 +87,7 @@ class MetricsLogger:
         self._fh = self.path.open("a", encoding="utf-8")
         self._lock = Lock()
         self._start_ts = time.time()
+        self._sleep_sec: float = 0.0
         self._totals: Dict[str, int] = {
             "llm_calls": 0,
             "llm_errors": 0,
@@ -186,25 +188,35 @@ class MetricsLogger:
             self._totals["input_tokens"] += usage.get("input_tokens") or 0
             self._totals["output_tokens"] += usage.get("output_tokens") or 0
 
+    def record_sleep(self, seconds: float) -> None:
+        """Accumulate inter-batch sleep so finalize can exclude it from pipeline_duration_sec."""
+        self._sleep_sec += seconds
+
     def finalize(
         self,
         *,
         total_hunks: int,
         total_comments_posted: int,
         provider_breakdown: Dict[str, str],
+        mode: Optional[str] = None,
+        workers: Optional[int] = None,
     ) -> None:
+        wall_sec = time.time() - self._start_ts
         self._write({
             "event": "pr_summary",
             "label": self.label,
             "provider_summary": self.provider_summary,
             "provider_breakdown": provider_breakdown,
+            "mode": mode,
+            "workers": workers,
             "total_hunks": total_hunks,
             "total_comments_posted": total_comments_posted,
             "total_llm_calls": self._totals["llm_calls"],
             "total_llm_errors": self._totals["llm_errors"],
             "total_input_tokens": self._totals["input_tokens"],
             "total_output_tokens": self._totals["output_tokens"],
-            "total_duration_sec": round(time.time() - self._start_ts, 3),
+            "pipeline_duration_sec": round(wall_sec - self._sleep_sec, 3),
+            "sleep_sec": round(self._sleep_sec, 3),
         })
         with self._lock:
             self._fh.close()

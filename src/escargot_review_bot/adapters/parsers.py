@@ -61,7 +61,10 @@ def _find_complete_json_array_span(s: str) -> Optional[tuple]:
 def sanitize_llm_output(raw: str) -> str:
     """Extract the first valid JSON array from raw text.
 
-    Prefer fenced ```json blocks; otherwise scan inline candidates. Returns the
+    Prefer fenced ```json blocks; otherwise extract the first *complete* array
+    using bracket-depth + string-escape tracking (so brackets inside a comment
+    body — e.g. `[[unlikely]]` or a leading `[CATEGORY]` tag — don't truncate
+    the match). Falls back to a naive regex scan only if that fails. Returns the
     JSON array string or an empty string when no valid array is found.
     """
     s = raw or ""
@@ -77,6 +80,20 @@ def sanitize_llm_output(raw: str) -> str:
         except Exception:
             pass
 
+    # Depth/string-aware extraction: correctly skips '[' / ']' that appear
+    # inside JSON string values, which the naive regex below cannot.
+    span = _find_complete_json_array_span(s)
+    if span is not None:
+        start, end = span
+        cand = s[start:end + 1]
+        try:
+            if isinstance(json.loads(cand), list):
+                logger.debug(f"Span JSON array extracted (len={len(cand)})")
+                return cand
+        except Exception:
+            pass
+
+    # Last-resort fallback for unusual shapes (kept for backward compatibility).
     candidates = JSON_ARRAY_RE.findall(s)
     for cand in candidates:
         try:

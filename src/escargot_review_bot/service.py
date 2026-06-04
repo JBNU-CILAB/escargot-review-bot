@@ -25,10 +25,11 @@ from escargot_review_bot.config.config import (
     EXPERIMENT_LOG_DIR,
     EXPERIMENT_LOGGING_ENABLED,
     OLLAMA_KEEP_ALIVE,
-    PASS_TYPES,
     REVIEW_INCLUDE_PATHS,
     REVIEW_PARALLEL_WORKERS,
     REVIEW_PARALLELISM,
+    REVIEW_PIPELINE,
+    active_pass_types,
     any_pass_uses_provider,
     resolve_pass_model,
     resolve_pass_provider,
@@ -495,7 +496,7 @@ def _run_review_pass(
     return out_comments
 
 
-_PASS_ORDER = ("defect", "refactor", "compiler", "style")
+_PASS_ORDER = ("defect", "compiler", "refactor", "style")
 
 def _merge_comments_by_line(
     hunk_item: Tuple[str, Hunk, List[LineMappingLite], Dict[int, Any]],
@@ -648,11 +649,13 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
     # Project name carries (PR, parallelism mode, provider) so ablation runs
     # land in clearly-separated LangSmith projects. Provider collapses to a
     # single slug when all 5 passes share the same provider; otherwise "mixed".
-    providers = {resolve_pass_provider(p) for p in PASS_TYPES}
+    providers = {resolve_pass_provider(p) for p in active_pass_types()}
     provider_slug = next(iter(providers)) if len(providers) == 1 else "mixed"
+    _run_prefix = os.environ.get("LANGSMITH_RUN_PREFIX", "")
+    _prefix_str = f"{_run_prefix}-" if _run_prefix else ""
     pr_project_name = (
-        f"escargot-review-bot/PR-{request.pull_request_number}"
-        f"-{REVIEW_PARALLELISM}-{provider_slug}"
+        f"escargot-review-bot/{_prefix_str}PR-{request.pull_request_number}"
+        f"-{REVIEW_PIPELINE}-{REVIEW_PARALLELISM}-{provider_slug}"
     )
     
     # 환경변수를 동적으로 변경하여 LangChain 자동 트레이싱도 PR별 프로젝트로 보냄
@@ -758,11 +761,17 @@ def _execute_review(request: ReviewRequest, pr_project_name: Optional[str] = Non
             )
             workers = 1
 
+    pass_types = active_pass_types()
     provider_breakdown: Dict[str, str] = {
-        p: f"{resolve_pass_provider(p)}:{resolve_pass_model(p)}" for p in PASS_TYPES
+        p: f"{resolve_pass_provider(p)}:{resolve_pass_model(p)}" for p in pass_types
     }
-    models_info = ", ".join(f"{p}={provider_breakdown[p]}" for p in PASS_TYPES)
-    if mode == "sequential":
+    models_info = ", ".join(f"{p}={provider_breakdown[p]}" for p in pass_types)
+    if REVIEW_PIPELINE == "single":
+        logger.info(
+            f"Single-pass pipeline (no judge): [{models_info}], "
+            f"{len(hunk_items)} hunks, threading={mode}, workers={workers}."
+        )
+    elif mode == "sequential":
         logger.info(
             f"Sequential (per-file phase batching): [{models_info}], "
             f"{len(hunk_items)} hunks across {len({fp for fp, *_ in hunk_items})} files."
@@ -781,7 +790,7 @@ def _execute_review(request: ReviewRequest, pr_project_name: Optional[str] = Non
     if EXPERIMENT_LOGGING_ENABLED:
         import os as _os
         provider_summary = "-".join(
-            sorted({resolve_pass_provider(p) for p in PASS_TYPES})
+            sorted({resolve_pass_provider(p) for p in pass_types})
         )
         metrics: MetricsLike = MetricsLogger(
             pr_number=request.pull_request_number,
@@ -879,12 +888,70 @@ def _execute_review(request: ReviewRequest, pr_project_name: Optional[str] = Non
             })
             return merged
 
+    def run_single_pass_hunk(i: int) -> List[Dict[str, Any]]:
+        """Single-pipeline: one combined 'single' pass per hunk, no judge merge.
+
+        `_run_review_pass("single", ...)` already applies the confidence /
+        target_id / HEAD-alignment filters and returns GitHubComment dicts, so
+        its output is the final comment set for the hunk.
+        """
+        fp, h, _, _ = hunk_items[i]
+        trace_name = hunk_trace_name(i)
+        with ls.trace(
+            name=trace_name,
+            run_type="chain",
+            project_name=pr_project_name,
+            inputs={
+                "file_path": fp,
+                "hunk_start": h.target_start,
+                "hunk_length": h.target_length,
+            },
+            metadata={
+                "file_path": fp,
+                "hunk_index": i,
+                "target_start": h.target_start,
+                "target_length": h.target_length,
+                "pipeline": "single",
+            },
+        ) as hunk_run:
+            comments = run_pass(i, "single")
+            hunk_run.end(outputs={"comment_count": len(comments)})
+            return comments
+
     all_github_comments: List[Dict[str, Any]] = []
 
     try:
         hunk_indices = list(range(len(hunk_items)))
 
-        if mode == "sequential":
+        if REVIEW_PIPELINE == "single":
+            # One combined 'single' pass per hunk, no judge merge. Threading still
+            # honors `mode`: sequential = serial; hunk/pass = ThreadPool over hunks
+            # (the inner pass-level concurrency is meaningless with one call per
+            # hunk, so `pass` collapses to the same shape as `hunk` here).
+            if mode == "sequential":
+                for i in hunk_indices:
+                    try:
+                        all_github_comments.extend(run_single_pass_hunk(i))
+                    except Exception as e:
+                        logger.exception(f"Hunk {i} single-pass failed: {e}")
+            else:
+                chunks = [hunk_indices[i:i + workers] for i in range(0, len(hunk_indices), workers)]
+                for chunk_idx, chunk in enumerate(chunks):
+                    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="hunk") as executor:
+                        future_to_idx = {executor.submit(run_single_pass_hunk, i): i for i in chunk}
+                        for future in as_completed(future_to_idx):
+                            hunk_idx = future_to_idx[future]
+                            try:
+                                all_github_comments.extend(future.result())
+                            except Exception as e:
+                                logger.exception(f"Hunk {hunk_idx} single-pass failed: {e}")
+                    # 90s inter-batch sleep: OpenAI TPM countermeasure (skipped for ollama).
+                    if chunk_idx < len(chunks) - 1 and not any_pass_uses_provider("ollama"):
+                        logger.info(f"Batch {chunk_idx + 1}/{len(chunks)} done. Sleeping 90s (TPM rate limit)...")
+                        metrics.record_sleep(90)
+                        time.sleep(90)
+
+        elif mode == "sequential":
             # Per-file phase batching: for each file, run each pass over all hunks,
             # then per-hunk judge merge.
             #
@@ -968,6 +1035,7 @@ def _execute_review(request: ReviewRequest, pr_project_name: Optional[str] = Non
                 # any pass uses ollama — otherwise it's pure wasted wall-clock.
                 if chunk_idx < len(chunks) - 1 and not any_pass_uses_provider("ollama"):
                     logger.info(f"Batch {chunk_idx + 1}/{len(chunks)} done. Sleeping 90s (TPM rate limit)...")
+                    metrics.record_sleep(90)
                     time.sleep(90)
 
         else:  # pass
@@ -986,6 +1054,7 @@ def _execute_review(request: ReviewRequest, pr_project_name: Optional[str] = Non
                 # any pass uses ollama — otherwise it's pure wasted wall-clock.
                 if chunk_idx < len(chunks) - 1 and not any_pass_uses_provider("ollama"):
                     logger.info(f"Batch {chunk_idx + 1}/{len(chunks)} done. Sleeping 90s (TPM rate limit)...")
+                    metrics.record_sleep(90)
                     time.sleep(90)
     finally:
         try:
@@ -993,6 +1062,8 @@ def _execute_review(request: ReviewRequest, pr_project_name: Optional[str] = Non
                 total_hunks=len(hunk_items),
                 total_comments_posted=len(all_github_comments),
                 provider_breakdown=provider_breakdown,
+                mode=mode,
+                workers=workers,
             )
         except Exception as e:
             logger.warning(f"Metrics finalize failed: {e}")
